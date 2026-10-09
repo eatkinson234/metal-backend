@@ -1,0 +1,13 @@
+{
+  "snapshot_files": 175,
+  "snapshot_bytes": 5606166,
+  "source_reconstruction_match": true,
+  "source_files": 5175,
+  "source_tree_sha256": "9c0a0df73d3f506ead4760132d8c0be82bb0b255bc1b5fd4fc8d5c604bb695d0",
+  "private_data_and_secret_scan_pass": true,
+  "relative_markdown_links_checked": 14,
+  "json_shell_python_syntax_pass": true,
+  "fresh_gameplay_GPU_builds_or_installs": false,
+  "preserved_existing_source": true,
+  "inventory_scope": "Counts and bytes exclude this publication-check report and the added launcher license."
+}

@@ -1,0 +1,47 @@
+{
+  "fixture_edits": [
+    {
+      "path": "Fixtures/expected-prepared-capacity-1.json",
+      "original_sha256": "d36f01b0d02316699d8ddfe36b51366f3ec564637be560222ed1e562947b61a4",
+      "published_sha256": "d94a79a955e1d9b2a71a925f25950fcf4935df42ba059cb49459d06fc7362a7d",
+      "sample_home_path_replaced": true
+    },
+    {
+      "path": "Fixtures/expected-prepared-capacity-4.json",
+      "original_sha256": "0447d0e4b21c265bac3d676d167ff085a6422894c090596512dbbea1af22aa6e",
+      "published_sha256": "c65c7d0b19f5ce8ce3b265f4dd2eb3d517acc9d8dd4a2753634523dd6aab1848",
+      "sample_home_path_replaced": true
+    },
+    {
+      "path": "Fixtures/expected-prepared-capacity-8.json",
+      "original_sha256": "e5c06950316902e4caa23c6b2e2914fae433d5dfb1c427f720d0a5d5f4aadf71",
+      "published_sha256": "1906c7b03ff21633225d9f555ace4faf110d819659107467f73db3bd5203b3c6",
+      "sample_home_path_replaced": true
+    },
+    {
+      "path": "Fixtures/native-serialized-capacity-1.json",
+      "original_sha256": "a0f10b13a68663c7b7ba95947e4dd270f946b6f379d14c4d9f6a56fdcf314954",
+      "published_sha256": "e1d41935418e73e4d905d255deafd417a1a761a727e459397a05953cc798e2b4",
+      "sample_home_path_replaced": true
+    },
+    {
+      "path": "Fixtures/native-serialized-capacity-4.json",
+      "original_sha256": "9982ba509dc3152ecf07aedda0ab948fc1abe7bd20f6b9b97fb2ce223612b160",
+      "published_sha256": "00e73ef0869c8701c0ed0b186faa67be5c8639622672b4f0a1c1853fe6ae0d62",
+      "sample_home_path_replaced": true
+    },
+    {
+      "path": "Fixtures/native-serialized-capacity-8.json",
+      "original_sha256": "b9523addada94b6427d482bb478ab19d5fb0617fea4ea4af7bebae76391e4420",
+      "published_sha256": "dc040572486928c511d4624344fdfde01a57b010be50735219fda560f2a75d71",
+      "sample_home_path_replaced": true
+    },
+    {
+      "path": "Fixtures/seed-config.json",
+      "original_sha256": "63fb88855966316187945f6287ac8790fddadb86972471c11cfe221fb8f07a53",
+      "published_sha256": "1a72555e06f2d319d06bff4837c6d8da9fcb5ea40d790781952c1eb65ccf006b",
+      "sample_home_path_replaced": true
+    }
+  ],
+  "reason": "Published configuration test fixtures use a sample home path; no user runtime profiles or generated Tests/artifacts are included."
+}

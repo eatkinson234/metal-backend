@@ -1,0 +1,117 @@
+{
+  "snapshot_date": "2026-10-09",
+  "run199_status": "FULL_NATIVE53_REPLAY_NORMAL_CLOCK_ORDINARY_CLOSE0_OBSERVER0_QUALIFIED_PACING",
+  "run199_windows": {
+    "original90": {
+      "frames": 5399,
+      "glass_intervals": {
+        "count": 5399,
+        "mean_ms": 16.666560391197713,
+        "stddev_ms": 4.376628224686779e-05,
+        "min_ms": 16.666291281580925,
+        "p50_ms": 16.666540876030922,
+        "p95_ms": 16.666624695062637,
+        "p99_ms": 16.66666753590107,
+        "max_ms": 16.666792333126068
+      },
+      "intervals_above_33_34_ms": 0,
+      "intervals_above_100_ms": 0
+    },
+    "supplement175": {
+      "frames": 10499,
+      "glass_intervals": {
+        "count": 10499,
+        "mean_ms": 16.666560170792184,
+        "stddev_ms": 0.6657028405834088,
+        "min_ms": 8.333208039402962,
+        "p50_ms": 16.666540876030922,
+        "p95_ms": 16.666624695062637,
+        "p99_ms": 16.66666753590107,
+        "max_ms": 29.16649915277958
+      },
+      "intervals_above_33_34_ms": 0,
+      "intervals_above_100_ms": 0
+    }
+  },
+  "run199_validation": "APIon/globalGPUshaderoff; actualstderrMetalAPIValidationEnabled, shaderfaultcoverage lost explicit",
+  "run199_preload_seconds": 19.24944124999456,
+  "run199_independent_verdict": "ACCEPT_QUALIFIED_RUN199_NATIVE_REPLAY_CLOCK_PACING_AND_ORDINARY_CLOSE_EVIDENCE",
+  "run199_promotion_accepted": false,
+  "run199_installed": false,
+  "launcher_recorded_CPU_checks": 85,
+  "ui_recorded_software_checks": 169,
+  "raw_evidence_references": [
+    {
+      "artifact": "PRIMARY-PROGRESS199.json",
+      "source_group": "native-metal",
+      "bytes": 29826,
+      "sha256": "47d9c49b6f78e6af9478adfb04c1baefe33dfe2f58185cb08c6fb11ccb270f42"
+    },
+    {
+      "artifact": "RESULT.json",
+      "source_group": "native-metal",
+      "bytes": 26396,
+      "sha256": "9e644927fb0fa665fe14c447ad5f1d20c41fe12bd73f14278678bcdc2b340a64"
+    },
+    {
+      "artifact": "ROOT-INDEPENDENT-CLOSURE203.json",
+      "source_group": "native-metal",
+      "bytes": 1915,
+      "sha256": "400cf6c1ef6b0630eb316145336fd650d8474e8e55e83ffd5d0269e523a864ad"
+    },
+    {
+      "artifact": "RESULT.json",
+      "source_group": "native-metal",
+      "bytes": 3790,
+      "sha256": "0117666ddaf38e4442daa6d1879f07e9505e230efa42637ce057b0ac957f82d3"
+    },
+    {
+      "artifact": "RESULT.json",
+      "source_group": "native-metal",
+      "bytes": 16448,
+      "sha256": "d8bbf52b298cfbad7c62491a8260926ba8e132658ad7d25cb52887fc9dfba658"
+    },
+    {
+      "artifact": "verification-light.md",
+      "source_group": "ui",
+      "bytes": 4352,
+      "sha256": "02db91e7d31f694ce4c6e45747601116564d874a27c06f3564c79ecf38ec4eb9"
+    },
+    {
+      "artifact": "tests-light.log",
+      "source_group": "ui",
+      "bytes": 3367,
+      "sha256": "0dbc8b1fc991b72b6e3abc9f8a6b004ec711fb4917e68ac076c77feef837fb00"
+    }
+  ],
+  "scope": "Original local receipt hashes identify reviewed evidence; private raw runtime artifacts and gameplay screenshots are retained locally. No new runtime tests were run for publication.",
+  "ui_source_manifest_sha256": "6c81458a8e0e8d3897e3e46c65e709a933d82275293fade971dc646bbff28667",
+  "ui_original_manifest_revision": 3,
+  "ui_imported_manifest_files_rehashed": [
+    "Assets/arena-prompt.txt",
+    "Assets/arena.png",
+    "LICENSE-Ryujinx.txt",
+    "Sources/App/CouchApp.swift",
+    "Sources/Models/Configuration.swift",
+    "Sources/Models/ControllerProfiles.swift",
+    "Sources/Models/LauncherPresentation.swift",
+    "Sources/Models/LobbyStore.swift",
+    "Sources/Models/SlotBook.swift",
+    "Sources/Runtime/CouchModel.swift",
+    "Sources/Support/SocketSender.c",
+    "Sources/Views/ControlBindingsView.swift",
+    "Sources/Views/ControllersView.swift",
+    "Sources/Views/CouchView.swift",
+    "Sources/Views/DesignSystem.swift",
+    "Sources/Views/HelpView.swift",
+    "Sources/Views/HeroView.swift",
+    "Sources/Views/PlayerDetailView.swift",
+    "Sources/Views/SettingsView.swift",
+    "Tests/ControllerPresetTests.swift",
+    "Tests/PresentationTests.swift",
+    "Tests/SlotTests.swift",
+    "script/build_and_run.sh",
+    "scripts/build.sh",
+    "scripts/test.sh"
+  ]
+}

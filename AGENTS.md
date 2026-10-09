@@ -161,6 +161,7 @@ switch-metal-backend/
 ├── demos/                 ← D1–D8 渐进式渲染 Demo
 ├── tests/                 ← 50+ 测试用例（4 层金字塔）
 ├── tools/                 ← gen_next_task.py、verify_progress.py 等
+├── smash-couch/           ← 用户要求同步的原生 Metal .53、启动器及 UI 源码快照
 ├── docs/                  ← 人类文档
 └── ci/                    ← CI/CD 流水线
 ```
@@ -377,4 +378,8 @@ python3 tools/gen_next_task.py
 
 ---
 
-*本文件最后更新：2026-06-11。修改时请更新日期。*
+*本文件最后更新：2026-10-09（新增 Smash Couch 快照入口）。*
+
+## Smash Couch 源码快照
+
+2026-10-09 用户要求同步的本地 Smash Couch 工作位于 `smash-couch/`；入口是其 `README.md`、`STATUS.md` 和 `BUILD.md`。这是保留原始源码语言和精确哈希的独立快照，不将旧蓝图任务标记为完成，也不改变原有 ADR。该快照的源码身份、诊断证据、运行验收和安装状态分别记录；后续运行仍需当前用户授权和原项目的准入检查。

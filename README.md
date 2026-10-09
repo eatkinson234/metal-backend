@@ -1,3 +1,9 @@
+# Latest Smash Couch work — October 9, 2026
+
+The current native Metal `.53` source snapshot, capped `53.2.0` launcher and light UI preview are in [smash-couch](smash-couch/README.md). See its [status](smash-couch/STATUS.md) for completed diagnostic evidence and remaining validation. The candidate is not installed or promoted.
+
+---
+
 # Switch Metal 后端
 
 > 为 Nintendo Switch 模拟器（基于 Ryubing）实现的原生 Apple Metal 图形后端。
