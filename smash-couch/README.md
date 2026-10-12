@@ -1,12 +1,11 @@
 # Smash Couch 原生 Metal
 
-最新公开版本：**58.2.0 / 原生 Metal .58 r15**，对应 2026-10-11 当前本机正式安装。用户最新反馈：“It is super smooth now which is awesome”。
+**最新正式安装：58.3.0 / 原生 Metal .58 r16**（2026-10-12 05:47 MDT）。已重新核对本机安装的两个可执行文件及运行包清单哈希。
 
-- [最新状态与验证边界](STATUS.md)
-- [58.2.0 源码、构建方法与回滚](releases/58.2.0)
-- [安装版本身份与哈希](releases/58.2.0/BUILD-IDENTITY.json)
-- [历史 .53 构建说明](BUILD.md)、[历史 .53 证据](evidence/VERIFICATION-SUMMARY.json)
+- [最新状态、已有证据与剩余验证](STATUS.md)
+- [58.3.0 已安装版本源码与构建/回滚](releases/58.3.0)
+- [58.3.0 构建身份](releases/58.3.0/BUILD-IDENTITY.json)
+- [r19 最新实验源码，未安装](experiments/r19)
+- [58.2.0 历史快照](releases/58.2.0)、[.53 历史构建说明](BUILD.md)
 
-`emulator/`、`launcher/`、`ui-preview/` 保留 10 月 9 日的 .53 快照；最新安装版本位于 `releases/58.2.0/`，不要混用两者。根目录 `src/` 与其历史阶段任务保持原样。
-
-本仓库提供源码，不包含 Nintendo 游戏、密钥、固件、用户存档、运行缓存或签名应用。快照保留原许可声明，路径脱敏范围记录于对应清单。
+当前运行保留 legacy pacing；r19 不能冒充已经交付。根目录 `src/` 原项目和 .53/58.2 历史快照保持保留。仓库仅含源码、文档与身份清单，不包含游戏、固件、密钥、存档、运行缓存或签名应用。

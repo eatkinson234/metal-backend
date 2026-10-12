@@ -1,0 +1,3013 @@
+diff --git a/src/Ryujinx/AppHost.cs b/src/Ryujinx/AppHost.cs
+index f5491c8..006f432 100644
+--- a/src/Ryujinx/AppHost.cs
++++ b/src/Ryujinx/AppHost.cs
+@@ -419,6 +419,24 @@ namespace Ryujinx.Ava
+             }
+         }
+ 
++        /// <summary>
++        /// The window moved to a display with another backing scale: the bounds in points did not change, so
++        /// re-apply the layer's contentsScale and the drawable size in pixels.
++        /// </summary>
++        internal void RefreshRendererScale()
++        {
++            RendererHost.EmbeddedWindow?.RefreshContentsScale();
++            SetRendererWindowSize(RendererHost.EmbeddedWindow?.Bounds.Size ?? RendererHost.Bounds.Size);
++        }
++
++        /// <summary>
++        /// The renderer moved under a still pointer (a full-screen change): re-apply the cursor rule at the next frame.
++        /// </summary>
++        internal void RefreshCursorState()
++        {
++            _cursorState = CursorStates.ForceChangeCursor;
++        }
++
+         private void Renderer_ScreenCaptured(object sender, ScreenCaptureImageInfo e)
+         {
+             if (e.Data.Length > 0 && e.Height > 0 && e.Width > 0)
+@@ -1293,17 +1311,21 @@ namespace Ryujinx.Ava
+                     }
+                 }
+ 
+-                Dispatcher.UIThread.Post(() =>
++                if (CouchWindowPolicy.AllowsCacheLoadCancel(CouchWindowPolicy.CouchMode))
+                 {
+-                    if (_keyboardInterface.GetKeyboardStateSnapshot().IsPressed(Key.Delete) && _viewModel.WindowState is not WindowState.FullScreen)
++                    Dispatcher.UIThread.Post(() =>
+                     {
+-                        Device.Processes.ActiveApplication.DiskCacheLoadState?.Cancel();
+-                    }
+-                });
++                        if (_keyboardInterface.GetKeyboardStateSnapshot().IsPressed(Key.Delete) && _viewModel.WindowState is not WindowState.FullScreen)
++                        {
++                            Device.Processes.ActiveApplication.DiskCacheLoadState?.Cancel();
++                        }
++                    });
++                }
+ 
+                 KeyboardHotkeyState currentHotkeyState = GetHotkeyState();
+ 
+-                if (currentHotkeyState != _prevHotkeyState)
++                if (currentHotkeyState != _prevHotkeyState &&
++                    CouchWindowPolicy.AllowsHotkey(currentHotkeyState, CouchWindowPolicy.CouchMode))
+                 {
+                     switch (currentHotkeyState)
+                     {
+diff --git a/source-r16/src/Ryujinx/UI/Helpers/CouchFullscreenSelfTest.cs b/src/Ryujinx/UI/Helpers/CouchFullscreenSelfTest.cs
+new file mode 100644
+index 0000000..87fcce6
+--- /dev/null
++++ b/src/Ryujinx/UI/Helpers/CouchFullscreenSelfTest.cs
+@@ -0,0 +1,630 @@
++using Avalonia.Controls;
++using Avalonia.Threading;
++using Ryujinx.Ava.UI.ViewModels;
++using Ryujinx.Ava.UI.Windows;
++using Ryujinx.Ava.Utilities.Configuration;
++using Ryujinx.Common.Logging;
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Runtime.InteropServices;
++using System.Runtime.Versioning;
++using System.Threading;
++using ObjC = Ryujinx.Common.Helper.ObjectiveC;
++
++namespace Ryujinx.Ava.UI.Helpers
++{
++    /// <summary>
++    /// Rig-only full-screen self-test. Inert unless SMASH_COUCH_FULLSCREEN_SELFTEST is "1" (test, then close the window
++    /// normally) or "keep" (test, keep playing). Some seconds after the game is on screen it posts in-process AppKit key
++    /// events (Fn+F, Control-Command-F, Escape, a plain F, and in a couch session F9/F4/F5/F1), toggles the NSWindow
++    /// directly like an Accessibility client and zooms it like a title-bar double-click, waits for each transition and
++    /// logs the window's full-screen bit, the view-model state, the chrome and the drawable size. It ends with one line
++    /// "SMASH_FULLSCREEN_SELFTEST result=PASS|FAIL ..." on stderr and in the log. Posting events to the own process
++    /// needs no Accessibility permission.
++    /// </summary>
++    internal sealed partial class CouchFullscreenSelfTest : IDisposable
++    {
++        private const string Prefix = "SMASH_FULLSCREEN_SELFTEST";
++        private const int DefaultDelaySeconds = 25;
++        private const int PollMs = 100;
++        private const int TransitionTimeoutMs = 6000;
++        // Longer than the toggle debounce, so every step starts from a settled window.
++        private const int SettleMs = CouchWindowPolicy.FullscreenToggleDelayMs + 500;
++        private const int KeyHoldMs = 150;
++
++        private const ulong FlagControl = 1UL << 18;
++        private const ulong FlagCommand = 1UL << 20;
++        private const ulong FlagFunction = 1UL << 23;
++        private const ulong StyleMaskFullScreen = 1UL << 14;
++
++        private const ushort KeyF = 3;
++        private const ushort KeyEscape = 53;
++        private const ushort KeyF1 = 122;
++        private const ushort KeyF4 = 118;
++        private const ushort KeyF5 = 96;
++        private const ushort KeyF9 = 101;
++
++        private static int _started;
++
++        private readonly MainWindow _window;
++        private readonly bool _closeWhenDone;
++        private readonly int _delaySeconds;
++        private readonly List<string> _failed = [];
++        private int _steps;
++        private volatile bool _cancelled;
++
++        public static CouchFullscreenSelfTest TryStart(MainWindow window)
++        {
++            // Default-off: no thread, no native call.
++            string mode = Environment.GetEnvironmentVariable("SMASH_COUCH_FULLSCREEN_SELFTEST");
++
++            if (mode is not ("1" or "keep") || !OperatingSystem.IsMacOS() || Interlocked.Exchange(ref _started, 1) != 0)
++            {
++                return null;
++            }
++
++            int delay = int.TryParse(Environment.GetEnvironmentVariable("SMASH_COUCH_FULLSCREEN_SELFTEST_DELAY_S"), out int value)
++                ? Math.Clamp(value, 5, 300)
++                : DefaultDelaySeconds;
++
++            return new CouchFullscreenSelfTest(window, mode == "1", delay);
++        }
++
++        [SupportedOSPlatform("macos")]
++        private CouchFullscreenSelfTest(MainWindow window, bool closeWhenDone, int delaySeconds)
++        {
++            _window = window;
++            _closeWhenDone = closeWhenDone;
++            _delaySeconds = delaySeconds;
++
++            new Thread(Run) { IsBackground = true, Name = "Couch full-screen self-test" }.Start();
++        }
++
++        public void Dispose()
++        {
++            _cancelled = true;
++        }
++
++        private readonly record struct Snapshot(
++            bool HasWindow, bool NsFullScreen, bool KeyWindow, bool AppActive,
++            WindowState VmState, WindowState WindowState, bool IsFullScreen, bool Menu, bool TitleExtends,
++            bool Running, bool Docked, bool Paused, string VSync,
++            int DrawableWidth, int DrawableHeight, int ExpectedWidth, int ExpectedHeight, double ContentsScale, double BackingScale)
++        {
++            public override string ToString() =>
++                $"ns_fullscreen={NsFullScreen} vm={VmState} window={WindowState} is_fullscreen={IsFullScreen} menu={Menu} " +
++                $"title_extends={TitleExtends} running={Running} key={KeyWindow} active={AppActive} docked={Docked} paused={Paused} " +
++                $"vsync={VSync} drawable={DrawableWidth}x{DrawableHeight} expected={ExpectedWidth}x{ExpectedHeight} " +
++                $"contents_scale={ContentsScale} backing_scale={BackingScale}";
++        }
++
++        [SupportedOSPlatform("macos")]
++        private void Run()
++        {
++            try
++            {
++                Report($"armed couch={CouchWindowPolicy.CouchMode} delay_s={_delaySeconds} close_when_done={_closeWhenDone}");
++
++                if (!WaitUntil(GameOnScreen, TimeSpan.Zero, TimeSpan.FromMinutes(10)))
++                {
++                    Finish("game-not-on-screen");
++                    return;
++                }
++
++                Thread.Sleep(TimeSpan.FromSeconds(_delaySeconds));
++
++                // The loading screen (shader cache) briefly follows the first renderer switch; frames, and with them
++                // drawable resizes, only flow once it has stayed away.
++                if (!WaitUntil(GameOnScreen, TimeSpan.FromSeconds(3), TimeSpan.FromMinutes(10)))
++                {
++                    Finish("game-not-presenting");
++                    return;
++                }
++
++                Snapshot start = OnUi(Read);
++                Report($"start {start}");
++
++                if (!start.KeyWindow)
++                {
++                    // The posted key events go to the key window; a rig launch is normally already frontmost.
++                    OnUi(Activate);
++                    Thread.Sleep(SettleMs);
++                    Report($"activated {OnUi(Read)}");
++                }
++
++                if (!start.NsFullScreen)
++                {
++                    Transition("native-enter-initial", ToggleNative, true);
++                }
++
++                Transition("fn-f", () => Press(KeyF, FlagFunction), false);
++                if (CouchWindowPolicy.ForEscape(WindowState.Normal, true, ConfigurationState.Instance.ShowConfirmExit, CouchWindowPolicy.CouchMode)
++                    is CouchWindowPolicy.EscapeAction.None)
++                {
++                    Unchanged("escape-windowed", () => Press(KeyEscape, 0));
++                }
++                else
++                {
++                    Report("step=escape-windowed skipped (Escape would open the exit prompt)");
++                }
++                Unchanged("plain-f", () => Press(KeyF, 0));
++                Transition("ctrl-cmd-f", () => Press(KeyF, FlagControl | FlagCommand), true);
++                Transition("escape-fullscreen", () => Press(KeyEscape, 0), false);
++                Transition("native-enter", ToggleNative, true);
++                Transition("ctrl-cmd-f-after-native", () => Press(KeyF, FlagControl | FlagCommand), false);
++                Transition("native-enter-2", ToggleNative, true);
++                Transition("native-exit", ToggleNative, false);
++                Transition("fn-f-after-native", () => Press(KeyF, FlagFunction), true);
++
++                // A zoomed windowed game is Maximized: one press must enter full screen (not un-zoom), also after
++                // AppKit restores the zoomed frame on the way out.
++                Transition("ctrl-cmd-f-before-zoom", () => Press(KeyF, FlagControl | FlagCommand), false);
++                Transition("native-zoom", ZoomNative, false, WindowState.Maximized);
++                Transition("ctrl-cmd-f-from-zoomed", () => Press(KeyF, FlagControl | FlagCommand), true);
++                Transition("ctrl-cmd-f-exit-zoomed", () => Press(KeyF, FlagControl | FlagCommand), false);
++                Transition("fn-f-from-zoomed", () => Press(KeyF, FlagFunction), true);
++
++                if (CouchWindowPolicy.CouchMode)
++                {
++                    Unchanged("f9-docked", () => Press(KeyF9, FlagFunction));
++                    Unchanged("f4-show-ui", () => Press(KeyF4, FlagFunction));
++                    Unchanged("f5-pause", () => Press(KeyF5, FlagFunction));
++                    Unchanged("f1-vsync", () => Press(KeyF1, FlagFunction));
++                }
++
++                Finish(null);
++            }
++            catch (Exception e)
++            {
++                if (!_cancelled)
++                {
++                    Finish($"exception:{e.GetType().Name}:{e.Message}");
++                }
++            }
++        }
++
++        private bool GameOnScreen()
++        {
++            return OnUi(() => _window.ViewModel.AppHost != null && _window.ViewModel.IsGameRunning &&
++                !_window.ViewModel.ShowLoadProgress && RenderView() != nint.Zero);
++        }
++
++        /// <summary>
++        /// A transition step: the action must end in the expected full-screen state with every view consistent, and in
++        /// <paramref name="expectVm"/> when it is given.
++        /// </summary>
++        [SupportedOSPlatform("macos")]
++        private void Transition(string name, Action action, bool expectFullScreen, WindowState? expectVm = null)
++        {
++            ThrowIfCancelled();
++            _steps++;
++
++            Stopwatch watch = Stopwatch.StartNew();
++            action();
++
++            Snapshot snapshot = default;
++            string problems = "timeout";
++
++            while (watch.ElapsedMilliseconds < TransitionTimeoutMs)
++            {
++                Thread.Sleep(PollMs);
++                snapshot = OnUi(Read);
++                problems = Problems(snapshot, expectFullScreen, expectVm);
++
++                if (problems.Length == 0)
++                {
++                    break;
++                }
++            }
++
++            long reachedMs = watch.ElapsedMilliseconds;
++
++            // Still consistent once the animation is surely over (AppKit reports a refused toggle only at its end).
++            Thread.Sleep(SettleMs);
++            snapshot = OnUi(Read);
++            problems = Problems(snapshot, expectFullScreen, expectVm);
++
++            Record(name, problems, $"expect_fullscreen={expectFullScreen} expect_vm={expectVm?.ToString() ?? "-"} reached_ms={reachedMs} {snapshot}");
++        }
++
++        /// <summary>A negative step: after the key, the window, the chrome and the emulation state must not change.</summary>
++        [SupportedOSPlatform("macos")]
++        private void Unchanged(string name, Action action)
++        {
++            ThrowIfCancelled();
++            _steps++;
++
++            Snapshot before = OnUi(Read);
++            action();
++            Thread.Sleep(SettleMs);
++            Snapshot after = OnUi(Read);
++
++            List<string> problems = [];
++            string state = Problems(after, before.NsFullScreen);
++
++            if (state.Length != 0)
++            {
++                problems.Add(state);
++            }
++
++            if (after.Docked != before.Docked)
++            {
++                problems.Add("docked-changed");
++            }
++
++            if (after.Paused != before.Paused)
++            {
++                problems.Add("pause-changed");
++            }
++
++            if (after.VSync != before.VSync)
++            {
++                problems.Add("vsync-changed");
++            }
++
++            Record(name, string.Join(',', problems), $"expect_unchanged_fullscreen={before.NsFullScreen} {after}");
++        }
++
++        private static string Problems(Snapshot s, bool expectFullScreen, WindowState? expectVm = null)
++        {
++            List<string> problems = [];
++
++            if (!s.HasWindow)
++            {
++                problems.Add("no-nswindow");
++            }
++
++            if (s.NsFullScreen != expectFullScreen)
++            {
++                problems.Add("nswindow");
++            }
++
++            if ((s.VmState is WindowState.FullScreen) != expectFullScreen)
++            {
++                problems.Add("vm-state");
++            }
++
++            if (s.WindowState != s.VmState)
++            {
++                problems.Add("window-vs-vm");
++            }
++
++            if (expectVm is { } vmState && s.VmState != vmState)
++            {
++                problems.Add($"vm-not-{vmState}");
++            }
++
++            if (s.IsFullScreen != expectFullScreen)
++            {
++                problems.Add("is-fullscreen");
++            }
++
++            if (s.Menu != CouchWindowPolicy.MenuAndStatusBarVisible(!expectFullScreen, CouchWindowPolicy.CouchMode))
++            {
++                problems.Add("menu");
++            }
++
++            if (s.TitleExtends != (expectFullScreen || !ConfigurationState.Instance.ShowTitleBar))
++            {
++                problems.Add("title-bar");
++            }
++
++            if (!s.Running)
++            {
++                problems.Add("not-running");
++            }
++
++            if (Math.Abs(s.DrawableWidth - s.ExpectedWidth) > 2 || Math.Abs(s.DrawableHeight - s.ExpectedHeight) > 2)
++            {
++                problems.Add("drawable-size");
++            }
++
++            if (Math.Abs(s.ContentsScale - s.BackingScale) > 0.001)
++            {
++                problems.Add("contents-scale");
++            }
++
++            return string.Join(',', problems);
++        }
++
++        private void Record(string name, string problems, string details)
++        {
++            bool ok = problems.Length == 0;
++
++            if (!ok)
++            {
++                _failed.Add(name);
++            }
++
++            Report($"step={name} ok={ok} problems={(ok ? "-" : problems)} {details}");
++        }
++
++        private void Finish(string error)
++        {
++            bool pass = error == null && _failed.Count == 0;
++
++            Report($"result={(pass ? "PASS" : "FAIL")} steps={_steps} failed={(_failed.Count == 0 ? "-" : string.Join(',', _failed))}" +
++                (error == null ? string.Empty : $" error={error}"));
++
++            if (_closeWhenDone && !_cancelled)
++            {
++                try
++                {
++                    // The normal close path (stop, save caches, exit), as DiagnosticPreloadClose uses it.
++                    Dispatcher.UIThread.Post(() =>
++                    {
++                        _window.ViewModel.IsClosing = true;
++                        _window.Close();
++                    });
++                }
++                catch (Exception e)
++                {
++                    Report($"close-request-failed error={e.GetType().Name}");
++                }
++            }
++        }
++
++        private static void Report(string message)
++        {
++            Logger.Notice.Print(LogClass.Application, $"{Prefix} {message}");
++
++            try
++            {
++                Console.Error.WriteLine($"{Prefix} {message}");
++            }
++            catch
++            {
++                // stderr closed: the log line above is enough.
++            }
++        }
++
++        private void ThrowIfCancelled()
++        {
++            if (_cancelled)
++            {
++                throw new OperationCanceledException();
++            }
++        }
++
++        /// <summary>Waits until the condition has held for <paramref name="stableFor"/> (sampled every 500 ms).</summary>
++        private bool WaitUntil(Func<bool> condition, TimeSpan stableFor, TimeSpan timeout)
++        {
++            Stopwatch watch = Stopwatch.StartNew();
++            Stopwatch held = null;
++
++            while (watch.Elapsed < timeout)
++            {
++                ThrowIfCancelled();
++
++                if (!condition())
++                {
++                    held = null;
++                }
++                else if ((held ??= Stopwatch.StartNew()).Elapsed >= stableFor)
++                {
++                    return true;
++                }
++
++                Thread.Sleep(500);
++            }
++
++            return false;
++        }
++
++        private static T OnUi<T>(Func<T> read) => Dispatcher.UIThread.Invoke(read);
++
++        private static void OnUi(Action action) => Dispatcher.UIThread.Invoke(action);
++
++        // UI thread only.
++        private nint RenderView() => _window.ViewModel.AppHost?.RendererHost?.EmbeddedWindow?.MacOSRenderView ?? nint.Zero;
++
++        // UI thread only.
++        [SupportedOSPlatform("macos")]
++        private nint NsWindow()
++        {
++            nint view = RenderView();
++
++            return view == nint.Zero ? nint.Zero : Native.Send(view, Native.Sel("window"));
++        }
++
++        // UI thread only.
++        [SupportedOSPlatform("macos")]
++        private Snapshot Read()
++        {
++            MainWindowViewModel vm = _window.ViewModel;
++            nint window = NsWindow();
++            nint view = RenderView();
++            nint app = Native.Send(Native.Class("NSApplication"), Native.Sel("sharedApplication"));
++
++            bool nsFullScreen = false, key = false;
++            double backing = 0, contentsScale = 0;
++            int drawableWidth = 0, drawableHeight = 0, expectedWidth = 0, expectedHeight = 0;
++
++            if (window != nint.Zero)
++            {
++                nsFullScreen = ((ulong)Native.Send(window, Native.Sel("styleMask")) & StyleMaskFullScreen) != 0;
++                key = Native.SendByte(window, Native.Sel("isKeyWindow")) != 0;
++                backing = Native.SendDouble(window, Native.Sel("backingScaleFactor"));
++
++                nint layer = Native.Send(view, Native.Sel("layer"));
++                Native.CGRect bounds = Native.SendRect(view, Native.Sel("bounds"));
++                expectedWidth = (int)(bounds.Width * backing);
++                expectedHeight = (int)(bounds.Height * backing);
++
++                if (layer != nint.Zero)
++                {
++                    Native.CGSize drawable = Native.SendSize(layer, Native.Sel("drawableSize"));
++                    drawableWidth = (int)drawable.Width;
++                    drawableHeight = (int)drawable.Height;
++                    contentsScale = Native.SendDouble(layer, Native.Sel("contentsScale"));
++                }
++            }
++
++            AppHost host = vm.AppHost;
++
++            return new Snapshot(
++                window != nint.Zero, nsFullScreen, key, Native.SendByte(app, Native.Sel("isActive")) != 0,
++                vm.WindowState, _window.WindowState, vm.IsFullScreen, vm.ShowMenuAndStatusBar, _window.TitleBar.ExtendsContentIntoTitleBar,
++                vm.IsGameRunning && host != null, ConfigurationState.Instance.System.EnableDockedMode.Value,
++                host?.Device?.System?.IsPaused ?? false, host?.Device?.VSyncMode.ToString() ?? "none",
++                drawableWidth, drawableHeight, expectedWidth, expectedHeight, contentsScale, backing);
++        }
++
++        // UI thread only.
++        [SupportedOSPlatform("macos")]
++        private void Activate()
++        {
++            nint app = Native.Send(Native.Class("NSApplication"), Native.Sel("sharedApplication"));
++            Native.SendVoid(app, Native.Sel("activateIgnoringOtherApps:"), 1);
++
++            nint window = NsWindow();
++
++            if (window != nint.Zero)
++            {
++                Native.SendVoid(window, Native.Sel("makeKeyAndOrderFront:"), nint.Zero);
++            }
++        }
++
++        /// <summary>What an Accessibility client setting AXFullScreen ends up doing: -[NSWindow toggleFullScreen:].</summary>
++        [SupportedOSPlatform("macos")]
++        private void ToggleNative()
++        {
++            OnUi(() =>
++            {
++                nint window = NsWindow();
++
++                if (window != nint.Zero)
++                {
++                    Native.SendVoid(window, Native.Sel("toggleFullScreen:"), nint.Zero);
++                }
++            });
++        }
++
++        /// <summary>
++        /// What a title-bar double-click or Option-click on the green button does: -[NSWindow zoom:]. It toggles, so a
++        /// window that is already zoomed is left as it is.
++        /// </summary>
++        [SupportedOSPlatform("macos")]
++        private void ZoomNative()
++        {
++            OnUi(() =>
++            {
++                nint window = NsWindow();
++
++                if (window != nint.Zero && Native.SendByte(window, Native.Sel("isZoomed")) == 0)
++                {
++                    Native.SendVoid(window, Native.Sel("zoom:"), nint.Zero);
++                }
++            });
++        }
++
++        /// <summary>Key down, a short hold (the hotkeys are polled each frame), key up, through the app's event queue.</summary>
++        [SupportedOSPlatform("macos")]
++        private static void Press(ushort keyCode, ulong flags)
++        {
++            OnUi(() => PostKey(keyCode, flags, true));
++            Thread.Sleep(KeyHoldMs);
++            OnUi(() => PostKey(keyCode, flags, false));
++        }
++
++        // UI thread only.
++        [SupportedOSPlatform("macos")]
++        private static void PostKey(ushort keyCode, ulong flags, bool down)
++        {
++            nint cgEvent = Native.CGEventCreateKeyboardEvent(nint.Zero, keyCode, (byte)(down ? 1 : 0));
++
++            if (cgEvent == nint.Zero)
++            {
++                throw new InvalidOperationException("CGEventCreateKeyboardEvent failed");
++            }
++
++            try
++            {
++                Native.CGEventSetFlags(cgEvent, flags);
++
++                // The NSEvent keeps its own reference to the CGEvent.
++                nint nsEvent = Native.Send(Native.Class("NSEvent"), Native.Sel("eventWithCGEvent:"), cgEvent);
++
++                if (nsEvent == nint.Zero)
++                {
++                    throw new InvalidOperationException("eventWithCGEvent: failed");
++                }
++
++                nint app = Native.Send(Native.Class("NSApplication"), Native.Sel("sharedApplication"));
++                Native.SendVoid(app, Native.Sel("postEvent:atStart:"), nsEvent, 0);
++            }
++            finally
++            {
++                Native.CFRelease(cgEvent);
++            }
++        }
++
++        [SupportedOSPlatform("macos")]
++        private static partial class Native
++        {
++            private const string ObjCRuntime = "/usr/lib/libobjc.A.dylib";
++            private const string CoreGraphics = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
++            private const string CoreFoundation = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
++
++            [StructLayout(LayoutKind.Sequential)]
++            public readonly struct CGSize
++            {
++                public readonly double Width;
++                public readonly double Height;
++            }
++
++            [StructLayout(LayoutKind.Sequential)]
++            public readonly struct CGRect
++            {
++                public readonly double X;
++                public readonly double Y;
++                public readonly double Width;
++                public readonly double Height;
++            }
++
++            public static nint Class(string name) => new ObjC.Object(name).ObjPtr;
++
++            public static nint Sel(string name) => sel_registerName(name);
++
++            [LibraryImport(ObjCRuntime, StringMarshalling = StringMarshalling.Utf8)]
++            private static partial nint sel_registerName(string name);
++
++            [LibraryImport(ObjCRuntime, EntryPoint = "objc_msgSend")]
++            public static partial nint Send(nint receiver, nint selector);
++
++            [LibraryImport(ObjCRuntime, EntryPoint = "objc_msgSend")]
++            public static partial nint Send(nint receiver, nint selector, nint argument);
++
++            [LibraryImport(ObjCRuntime, EntryPoint = "objc_msgSend")]
++            public static partial byte SendByte(nint receiver, nint selector);
++
++            [LibraryImport(ObjCRuntime, EntryPoint = "objc_msgSend")]
++            public static partial double SendDouble(nint receiver, nint selector);
++
++            [LibraryImport(ObjCRuntime, EntryPoint = "objc_msgSend")]
++            public static partial CGSize SendSize(nint receiver, nint selector);
++
++            [LibraryImport(ObjCRuntime, EntryPoint = "objc_msgSend")]
++            public static partial CGRect SendRect(nint receiver, nint selector);
++
++            [LibraryImport(ObjCRuntime, EntryPoint = "objc_msgSend")]
++            public static partial void SendVoid(nint receiver, nint selector, nint argument);
++
++            [LibraryImport(ObjCRuntime, EntryPoint = "objc_msgSend")]
++            public static partial void SendVoid(nint receiver, nint selector, byte argument);
++
++            [LibraryImport(ObjCRuntime, EntryPoint = "objc_msgSend")]
++            public static partial void SendVoid(nint receiver, nint selector, nint argument, byte flag);
++
++            [LibraryImport(CoreGraphics)]
++            public static partial nint CGEventCreateKeyboardEvent(nint source, ushort virtualKey, byte keyDown);
++
++            [LibraryImport(CoreGraphics)]
++            public static partial void CGEventSetFlags(nint cgEvent, ulong flags);
++
++            [LibraryImport(CoreFoundation)]
++            public static partial void CFRelease(nint cf);
++        }
++    }
++}
+diff --git a/source-r16/src/Ryujinx/UI/Helpers/CouchWindowPolicy.cs b/src/Ryujinx/UI/Helpers/CouchWindowPolicy.cs
+new file mode 100644
+index 0000000..2096fc9
+--- /dev/null
++++ b/src/Ryujinx/UI/Helpers/CouchWindowPolicy.cs
+@@ -0,0 +1,124 @@
++using Avalonia.Controls;
++using Ryujinx.Ava.Common;
++using System;
++
++namespace Ryujinx.Ava.UI.Helpers
++{
++    /// <summary>
++    /// Window rules for full screen and for a Smash Couch session (the launcher's controller bridge is active).
++    /// Pure functions of their inputs so CPU tests can check them; the callers own the side effects.
++    /// </summary>
++    internal static class CouchWindowPolicy
++    {
++        // Same test as CouchBridge.Enabled in Ryujinx.Input.SDL2: the launcher (and the rig) always pass the
++        // bridge socket, and nothing else sets it.
++        public static readonly bool CouchMode = Environment.GetEnvironmentVariable("SMASH_COUCH_SOCKET") is { Length: > 0 };
++
++        // Longer than the AppKit full-screen animation (about 0.5-0.9 s), so a second press cannot land mid-transition.
++        public const int FullscreenToggleDelayMs = 1000;
++
++        private const ulong NSEventTypeKeyDown = 10;
++        private const ulong NSEventModifierFlagFunction = 1UL << 23;
++        private const ushort KeyCodeF = 3; // kVK_ANSI_F
++
++        public readonly record struct Chrome(bool IsFullScreen, bool ExtendsContentIntoTitleBar, bool? ShowMenuAndStatusBar);
++
++        public enum EscapeAction
++        {
++            None,
++            LeaveFullScreen,
++            ShowExitPrompt,
++        }
++
++        /// <summary>
++        /// Chrome to apply after the real window state changed, or null when nothing should change: only entering or
++        /// leaving full screen changes the chrome (minimizing and zooming keep it, as before).
++        /// ShowMenuAndStatusBar is null when the menu should keep its current value (no game running).
++        /// </summary>
++        public static Chrome? ChromeFor(WindowState state, bool wasFullScreen, bool gameRunning, bool showTitleBar, bool couchMode)
++        {
++            if (state is WindowState.Minimized)
++            {
++                return null;
++            }
++
++            bool fullScreen = state is WindowState.FullScreen;
++
++            if (fullScreen == wasFullScreen)
++            {
++                return null;
++            }
++
++            bool? menu = gameRunning ? MenuAndStatusBarVisible(!fullScreen, couchMode) : null;
++
++            return new Chrome(fullScreen, fullScreen || !showTitleBar, menu);
++        }
++
++        /// <summary>
++        /// A couch session never shows the Ryujinx menu or status bar: Options could save a configuration the
++        /// launcher then refuses at the next launch, and the menu puts Stop and Settings one click away.
++        /// </summary>
++        public static bool MenuAndStatusBarVisible(bool requested, bool couchMode) => requested && !couchMode;
++
++        /// <summary>
++        /// Full screen goes to Normal; every other state enters full screen. The state is the real window's (two-way
++        /// binding), so a zoomed window (Magnet, a title-bar double-click, or the frame AppKit restores when leaving full
++        /// screen) is Maximized here; upstream's "anything but Normal goes to Normal" made that press, and --fullscreen
++        /// at startup, un-zoom the window instead. AppKit enters full screen from a zoomed window directly.
++        /// </summary>
++        public static WindowState NextFullscreenState(WindowState current) =>
++            current is WindowState.FullScreen ? WindowState.Normal : WindowState.FullScreen;
++
++        public static bool ToggleDebounced(long nowMs, long lastToggleMs) => nowMs - lastToggleMs < FullscreenToggleDelayMs;
++
++        /// <summary>
++        /// Escape leaves full screen. It only offers to stop the game where a confirmation will be asked:
++        /// with the exit prompt off, or in a couch session, it never stops emulation.
++        /// </summary>
++        public static EscapeAction ForEscape(WindowState state, bool gameRunning, bool confirmExit, bool couchMode)
++        {
++            if (state is WindowState.FullScreen)
++            {
++                return EscapeAction.LeaveFullScreen;
++            }
++
++            return gameRunning && confirmExit && !couchMode ? EscapeAction.ShowExitPrompt : EscapeAction.None;
++        }
++
++        /// <summary>
++        /// Single-key hotkeys that change emulation state (pacing, pause, resolution) or show the menu stay off in a
++        /// couch session; screenshot, mute and volume stay available.
++        /// </summary>
++        public static bool AllowsHotkey(KeyboardHotkeyState state, bool couchMode) => !couchMode || state switch
++        {
++            KeyboardHotkeyState.ToggleVSyncMode or
++            KeyboardHotkeyState.ShowUI or
++            KeyboardHotkeyState.Pause or
++            KeyboardHotkeyState.ResScaleUp or
++            KeyboardHotkeyState.ResScaleDown or
++            KeyboardHotkeyState.CustomVSyncIntervalIncrement or
++            KeyboardHotkeyState.CustomVSyncIntervalDecrement => false,
++            _ => true,
++        };
++
++        // F9 (docked mode) and Delete (cancel the shader cache load) are one key each; a couch session keeps the
++        // docked mode the launcher pinned and always loads the cache.
++        public static bool AllowsDockedModeToggle(bool couchMode) => !couchMode;
++
++        public static bool AllowsCacheLoadCancel(bool couchMode) => !couchMode;
++
++        /// <summary>
++        /// Fn/Globe+F, the standard macOS full-screen shortcut. Avalonia drops the fn modifier (the key arrives as a
++        /// plain F), so the decision uses the AppKit event that is being dispatched.
++        /// </summary>
++        public static bool IsGlobeF(ulong eventType, ulong modifierFlags, ushort keyCode)
++        {
++            const ulong otherModifiers = (1UL << 17) | (1UL << 18) | (1UL << 19) | (1UL << 20); // shift, control, option, command
++
++            return eventType == NSEventTypeKeyDown &&
++                keyCode == KeyCodeF &&
++                (modifierFlags & NSEventModifierFlagFunction) != 0 &&
++                (modifierFlags & otherModifiers) == 0;
++        }
++    }
++}
+diff --git a/src/Ryujinx/UI/Renderer/EmbeddedWindow.cs b/src/Ryujinx/UI/Renderer/EmbeddedWindow.cs
+index 21c3996..974d601 100644
+--- a/src/Ryujinx/UI/Renderer/EmbeddedWindow.cs
++++ b/src/Ryujinx/UI/Renderer/EmbeddedWindow.cs
+@@ -70,6 +70,21 @@ namespace Ryujinx.Ava.UI.Renderer
+             _updateBoundsCallback?.Invoke(rect);
+         }
+ 
++        /// <summary>
++        /// Re-applies the backing scale to the native layer (macOS: CAMetalLayer.contentsScale) after the window
++        /// moved to a display with another scale, which changes no bounds.
++        /// </summary>
++        public void RefreshContentsScale()
++        {
++            _updateBoundsCallback?.Invoke(Bounds);
++        }
++
++        /// <summary>The child NSView the game renders into (macOS only, else zero); for diagnostics.</summary>
++        public nint MacOSRenderView => NsView;
++
++        // The window's real backing scale; Program.DesktopScaleFactor only changes on a ScalingChanged event.
++        private double BackingScale => TopLevel.GetTopLevel(this)?.RenderScaling ?? Program.DesktopScaleFactor;
++
+         protected override IPlatformHandle CreateNativeControlCore(IPlatformHandle control)
+         {
+             if (OperatingSystem.IsLinux())
+@@ -186,12 +201,12 @@ namespace Ryujinx.Ava.UI.Renderer
+             // Make its renderer our metal layer.
+             child.SendMessage("setWantsLayer:", 1);
+             child.SendMessage("setLayer:", metalLayer);
+-            metalLayer.SendMessage("setContentsScale:", Program.DesktopScaleFactor);
++            metalLayer.SendMessage("setContentsScale:", BackingScale);
+ 
+             // Ensure the scale factor is up to date.
+             _updateBoundsCallback = rect =>
+             {
+-                metalLayer.SendMessage("setContentsScale:", Program.DesktopScaleFactor);
++                metalLayer.SendMessage("setContentsScale:", BackingScale);
+             };
+ 
+             nint nsView = child.ObjPtr;
+diff --git a/src/Ryujinx/UI/Renderer/EmbeddedWindowMetal.cs b/src/Ryujinx/UI/Renderer/EmbeddedWindowMetal.cs
+index 9e92d92..3dfda38 100644
+--- a/src/Ryujinx/UI/Renderer/EmbeddedWindowMetal.cs
++++ b/src/Ryujinx/UI/Renderer/EmbeddedWindowMetal.cs
+@@ -1,4 +1,7 @@
++using Avalonia.Threading;
+ using Ryujinx.Common.Helper;
++using Ryujinx.Graphics.GAL;
++using Ryujinx.Graphics.Metal;
+ using SharpMetal.QuartzCore;
+ using System;
+ 
+@@ -6,6 +9,8 @@ namespace Ryujinx.Ava.UI.Renderer
+ {
+     public class EmbeddedWindowMetal : EmbeddedWindow
+     {
++        private IDisposable _refreshSampler;
++
+         public CAMetalLayer CreateSurface()
+         {
+             if (OperatingSystem.IsMacOS() && RunningPlatform.IsArm)
+@@ -15,5 +20,33 @@ namespace Ryujinx.Ava.UI.Renderer
+             
+             throw new NotSupportedException($"Cannot create a {nameof(CAMetalLayer)} without being on ARM Mac.");
+         }
++
++        public override void OnWindowCreated()
++        {
++            base.OnWindowCreated();
++
++            // Refresh-anchored presents need the refresh timing of the screen showing the game; AppKit
++            // is read here on the UI thread, four times a second (screen moves, mode changes).
++            if (OperatingSystem.IsMacOS() && !DisplayPacing.Legacy && _refreshSampler == null)
++            {
++                _refreshSampler = DispatcherTimer.Run(() =>
++                {
++                    if (OperatingSystem.IsMacOS())
++                    {
++                        DisplayRefreshSampler.SampleOnMainThread(NsView);
++                    }
++
++                    return true;
++                }, TimeSpan.FromMilliseconds(250), DispatcherPriority.Normal);
++            }
++        }
++
++        protected override void OnWindowDestroying()
++        {
++            _refreshSampler?.Dispose();
++            _refreshSampler = null;
++
++            base.OnWindowDestroying();
++        }
+     }
+ }
+diff --git a/src/Ryujinx/UI/ViewModels/MainWindowViewModel.cs b/src/Ryujinx/UI/ViewModels/MainWindowViewModel.cs
+index 1dd4a6b..a11fc2d 100644
+--- a/src/Ryujinx/UI/ViewModels/MainWindowViewModel.cs
++++ b/src/Ryujinx/UI/ViewModels/MainWindowViewModel.cs
+@@ -57,7 +57,6 @@ namespace Ryujinx.Ava.UI.ViewModels
+ {
+     public partial class MainWindowViewModel : BaseModel
+     {
+-        private const int HotKeyPressDelayMs = 500;
+         private delegate int LoadContentFromFolderDelegate(List<string> dirs, out int numRemoved);
+ 
+         [ObservableProperty] private ObservableCollectionExtended<ApplicationData> _applications;
+@@ -75,7 +74,6 @@ namespace Ryujinx.Ava.UI.ViewModels
+         [ObservableProperty] private bool _isFullScreen;
+         [ObservableProperty] private int _progressMaximum;
+         [ObservableProperty] private int _progressValue;
+-        [ObservableProperty] private bool _showMenuAndStatusBar = true;
+         [ObservableProperty] private bool _showStatusSeparator;
+         [ObservableProperty] private Brush _progressBarForegroundColor;
+         [ObservableProperty] private Brush _progressBarBackgroundColor;
+@@ -92,7 +90,8 @@ namespace Ryujinx.Ava.UI.ViewModels
+         [ObservableProperty] private bool _showAll;
+         [ObservableProperty] private string _lastScannedAmiiboId;
+         [ObservableProperty] private ReadOnlyObservableCollection<ApplicationData> _appsObservableList;
+-        [ObservableProperty] private long _lastFullscreenToggle = Environment.TickCount64;
++        // The first toggle is never debounced: --fullscreen requests it soon after the window opens.
++        [ObservableProperty] private long _lastFullscreenToggle = Environment.TickCount64 - CouchWindowPolicy.FullscreenToggleDelayMs;
+         [ObservableProperty] private bool _showContent = true;
+         [ObservableProperty] private float _volumeBeforeMute;
+         [ObservableProperty] private bool _areMimeTypesRegistered = FileAssociationHelper.AreMimeTypesRegistered;
+@@ -115,6 +114,7 @@ namespace Ryujinx.Ava.UI.ViewModels
+         
+         private bool _showLoadProgress;
+         private bool _isGameRunning;
++        private bool _showMenuAndStatusBar = CouchWindowPolicy.MenuAndStatusBarVisible(true, CouchWindowPolicy.CouchMode);
+         private bool _isAmiiboRequested;
+         private bool _isAmiiboBinRequested;
+         private string _searchText;
+@@ -237,6 +237,13 @@ namespace Ryujinx.Ava.UI.ViewModels
+             }
+         }
+ 
++        public bool ShowMenuAndStatusBar
++        {
++            get => _showMenuAndStatusBar;
++            // Every writer (full screen, F4, game exit) goes through the couch rule here.
++            set => SetProperty(ref _showMenuAndStatusBar, CouchWindowPolicy.MenuAndStatusBarVisible(value, CouchWindowPolicy.CouchMode));
++        }
++
+         public bool StatusBarVisible
+         {
+             get => _statusBarVisible && EnableNonGameRunningControls;
+@@ -1377,7 +1384,7 @@ namespace Ryujinx.Ava.UI.ViewModels
+ 
+         public void ToggleDockMode()
+         {
+-            if (IsGameRunning)
++            if (IsGameRunning && CouchWindowPolicy.AllowsDockedModeToggle(CouchWindowPolicy.CouchMode))
+             {
+                 ConfigurationState.Instance.System.EnableDockedMode.Toggle();
+             }
+@@ -1406,15 +1413,16 @@ namespace Ryujinx.Ava.UI.ViewModels
+ 
+         public async Task ExitCurrentState()
+         {
+-            if (WindowState is WindowState.FullScreen)
++            switch (CouchWindowPolicy.ForEscape(WindowState, IsGameRunning, ConfigurationState.Instance.ShowConfirmExit, CouchWindowPolicy.CouchMode))
+             {
+-                ToggleFullscreen();
+-            }
+-            else if (IsGameRunning)
+-            {
+-                await Task.Delay(100);
++                case CouchWindowPolicy.EscapeAction.LeaveFullScreen:
++                    ToggleFullscreen();
++                    break;
++                case CouchWindowPolicy.EscapeAction.ShowExitPrompt:
++                    await Task.Delay(100);
+ 
+-                AppHost?.ShowExitPrompt();
++                    AppHost?.ShowExitPrompt();
++                    break;
+             }
+         }
+ 
+@@ -1735,35 +1743,46 @@ namespace Ryujinx.Ava.UI.ViewModels
+ 
+         public void ToggleFullscreen()
+         {
+-            if (Environment.TickCount64 - LastFullscreenToggle < HotKeyPressDelayMs)
++            if (CouchWindowPolicy.ToggleDebounced(Environment.TickCount64, LastFullscreenToggle))
+             {
+                 return;
+             }
+ 
+             LastFullscreenToggle = Environment.TickCount64;
+ 
+-            if (WindowState is not WindowState.Normal)
+-            {
+-                WindowState = WindowState.Normal;
+-                Window.TitleBar.ExtendsContentIntoTitleBar = !ConfigurationState.Instance.ShowTitleBar;
++            // Only request the state. The chrome follows the window's real state (ApplyWindowStateChrome),
++            // so the green button, Mission Control, Fn+F and Accessibility end up identical to this path.
++            WindowState = CouchWindowPolicy.NextFullscreenState(WindowState);
++        }
+ 
+-                if (IsGameRunning)
+-                {
+-                    ShowMenuAndStatusBar = true;
+-                }
++        /// <summary>
++        /// Called by MainWindow after every change of its real WindowState (the binding is two-way, so WindowState
++        /// here already follows the window). Entering or leaving full screen sets the title bar, the menu and status
++        /// bar and IsFullScreen from that state, whoever started the transition.
++        /// </summary>
++        internal void ApplyWindowStateChrome(WindowState state)
++        {
++            CouchWindowPolicy.Chrome? chrome = CouchWindowPolicy.ChromeFor(state, IsFullScreen, IsGameRunning,
++                ConfigurationState.Instance.ShowTitleBar, CouchWindowPolicy.CouchMode);
++
++            if (chrome is not { } applied)
++            {
++                return;
+             }
+-            else
++
++            IsFullScreen = applied.IsFullScreen;
++
++            if (Window != null)
+             {
+-                WindowState = WindowState.FullScreen;
+-                Window.TitleBar.ExtendsContentIntoTitleBar = true;
++                Window.TitleBar.ExtendsContentIntoTitleBar = applied.ExtendsContentIntoTitleBar;
++            }
+ 
+-                if (IsGameRunning)
+-                {
+-                    ShowMenuAndStatusBar = false;
+-                }
++            if (applied.ShowMenuAndStatusBar is bool showMenu)
++            {
++                ShowMenuAndStatusBar = showMenu;
+             }
+ 
+-            IsFullScreen = WindowState is WindowState.FullScreen;
++            AppHost?.RefreshCursorState();
+         }
+ 
+         public static void SaveConfig()
+diff --git a/src/Ryujinx/UI/Windows/MainWindow.axaml b/src/Ryujinx/UI/Windows/MainWindow.axaml
+index 7606d41..3424e3f 100644
+--- a/src/Ryujinx/UI/Windows/MainWindow.axaml
++++ b/src/Ryujinx/UI/Windows/MainWindow.axaml
+@@ -11,7 +11,7 @@
+     xmlns:main="clr-namespace:Ryujinx.Ava.UI.Views.Main"
+     Cursor="{Binding Cursor}"
+     Title="{Binding Title}"
+-    WindowState="{Binding WindowState}"
++    WindowState="{Binding WindowState, Mode=TwoWay}"
+     Width="{Binding WindowWidth}"
+     Height="{Binding WindowHeight}"
+     MinWidth="800"
+diff --git a/src/Ryujinx/UI/Windows/MainWindow.axaml.cs b/src/Ryujinx/UI/Windows/MainWindow.axaml.cs
+index d2fb26c..3a3be21 100644
+--- a/src/Ryujinx/UI/Windows/MainWindow.axaml.cs
++++ b/src/Ryujinx/UI/Windows/MainWindow.axaml.cs
+@@ -76,6 +76,7 @@ namespace Ryujinx.Ava.UI.Windows
+         public readonly double StatusBarHeight;
+         public readonly double MenuBarHeight;
+         private readonly DiagnosticPreloadClose _diagnosticClose;
++        private readonly CouchFullscreenSelfTest _fullscreenSelfTest;
+         private bool _diagnosticWindowClosed;
+ 
+         public MainWindow()
+@@ -115,6 +116,18 @@ namespace Ryujinx.Ava.UI.Windows
+ 
+                 _ = this.GetObservable(IsActiveProperty).Subscribe(it => ViewModel.IsActive = it);
+                 this.ScalingChanged += OnScalingChanged;
++
++                // The real window state is the single source of truth for full screen. This runs after Avalonia
++                // applied the change, for every route: ToggleFullscreen, the green button, Mission Control,
++                // Fn+F or an Accessibility client.
++                _ = this.GetPropertyChangedObservable(WindowStateProperty)
++                    .Subscribe(change => ViewModel.ApplyWindowStateChrome((WindowState)change.NewValue!));
++
++                if (OperatingSystem.IsMacOS())
++                {
++                    // Tunnel, so a focused control cannot swallow the key first.
++                    AddHandler(KeyDownEvent, OnMacGlobeFKeyDown, RoutingStrategies.Tunnel);
++                }
+             }
+ 
+             _diagnosticClose = DiagnosticPreloadClose.TryStartForOwnedWindow(
+@@ -127,6 +140,57 @@ namespace Ryujinx.Ava.UI.Windows
+                     ViewModel.IsClosing = true;
+                     Close();
+                 }));
++
++            _fullscreenSelfTest = CouchFullscreenSelfTest.TryStart(this);
++        }
++
++        /// <summary>
++        /// Fn/Globe+F toggles full screen like in other Mac apps. AppKit only routes it to a toggleFullScreen: menu
++        /// item, which Avalonia's menu does not have, and Avalonia drops the fn modifier, so it arrives here as a
++        /// plain F. KeyDown is raised synchronously from -[AvnView keyDown:], so NSApp.currentEvent is that key.
++        /// </summary>
++        [SupportedOSPlatform("macos")]
++        private void OnMacGlobeFKeyDown(object sender, KeyEventArgs e)
++        {
++            if (e.Key != Key.F || e.KeyModifiers != KeyModifiers.None || !CurrentAppKitEventIsGlobeF(out bool isRepeat))
++            {
++                return;
++            }
++
++            e.Handled = true;
++
++            // Holding the keys must not toggle again once the debounce has passed.
++            if (!isRepeat)
++            {
++                ViewModel.ToggleFullscreen();
++            }
++        }
++
++        [SupportedOSPlatform("macos")]
++        private static bool CurrentAppKitEventIsGlobeF(out bool isRepeat)
++        {
++            isRepeat = false;
++
++            ObjectiveC.Object nsEvent = new ObjectiveC.Object("NSApplication").GetFromMessage("sharedApplication").GetFromMessage("currentEvent");
++
++            if (nsEvent.ObjPtr == nint.Zero)
++            {
++                return false;
++            }
++
++            ulong type = (ulong)nsEvent.GetFromMessage("type").ObjPtr;
++
++            // keyCode and isARepeat are only valid on key events (AppKit raises otherwise).
++            if (type != 10) // NSEventTypeKeyDown
++            {
++                return false;
++            }
++
++            ulong flags = (ulong)nsEvent.GetFromMessage("modifierFlags").ObjPtr;
++            ushort keyCode = (ushort)nsEvent.GetFromMessage("keyCode").ObjPtr;
++            isRepeat = ((ulong)nsEvent.GetFromMessage("isARepeat").ObjPtr & 0xFF) != 0;
++
++            return CouchWindowPolicy.IsGlobeF(type, flags, keyCode);
+         }
+ 
+         /// <summary>
+@@ -142,6 +206,7 @@ namespace Ryujinx.Ava.UI.Windows
+         {
+             _diagnosticWindowClosed = true;
+             _diagnosticClose?.Dispose();
++            _fullscreenSelfTest?.Dispose();
+             base.OnClosed(e);
+             if (PlatformSettings != null)
+             {
+@@ -177,6 +242,10 @@ namespace Ryujinx.Ava.UI.Windows
+         private void OnScalingChanged(object sender, EventArgs e)
+         {
+             Program.DesktopScaleFactor = this.RenderScaling;
++
++            // Moving to a display with another backing scale keeps the bounds in points, so no BoundsChanged
++            // follows: resize the drawable and the layer's contentsScale here.
++            ViewModel.AppHost?.RefreshRendererScale();
+         }
+ 
+         private void ApplicationLibrary_ApplicationCountUpdated(object sender, ApplicationCountUpdatedEventArgs e)
+@@ -857,6 +926,11 @@ namespace Ryujinx.Ava.UI.Windows
+             if (ConfigurationState.Instance.FocusLostActionType.Value is FocusLostType.DoNothing)
+                 return;
+ 
++            // A couch session keeps every controller live while another window is in front (players on a second
++            // display, the launcher, a dialog). The launcher pins DoNothing; this also covers an edited config.
++            if (CouchWindowPolicy.CouchMode)
++                return;
++
+             if (ViewModel.AppHost is null) return;
+ 
+             switch (ConfigurationState.Instance.FocusLostActionType.Value)
+diff --git a/source-r16/src/Ryujinx.Graphics.GAL/DisplayPacing.cs b/src/Ryujinx.Graphics.GAL/DisplayPacing.cs
+new file mode 100644
+index 0000000..63a4a38
+--- /dev/null
++++ b/src/Ryujinx.Graphics.GAL/DisplayPacing.cs
+@@ -0,0 +1,42 @@
++using System;
++using System.IO;
++
++namespace Ryujinx.Graphics.GAL;
++
++// Process-wide pacing policy switch, read once. The default presents each frame at a real display
++// refresh and locks the emulated 60 Hz vsync to the display (Metal backend only). Legacy restores the
++// r15 behaviour exactly (CPU-clock present schedule, free-running composer timer):
++//  - SMASH_COUCH_PACING=legacy (rig A/B; the launcher strips SMASH_COUCH_* variables), or
++//  - a file named pacing-legacy in the private data directory the launcher passes
++//    (SMASH_COUCH_PRIVATE_DATA), so a couch session can go back to r15 pacing at the next game launch
++//    without reinstalling the runtime. Its contents are ignored; delete it to return to the default.
++public static class DisplayPacing
++{
++    public const string LegacyFlagFileName = "pacing-legacy";
++
++    // Why legacy pacing is on (for the log), null for the default.
++    public static readonly string LegacySource = ReadLegacySource(
++        Environment.GetEnvironmentVariable("SMASH_COUCH_PACING"),
++        Environment.GetEnvironmentVariable("SMASH_COUCH_PRIVATE_DATA"),
++        File.Exists);
++
++    public static readonly bool Legacy = LegacySource != null;
++
++    public static string ReadLegacySource(string pacing, string privateData, Func<string, bool> fileExists)
++    {
++        if (string.Equals(pacing, "legacy", StringComparison.Ordinal)) return "SMASH_COUCH_PACING=legacy";
++        try
++        {
++            if (!string.IsNullOrEmpty(privateData) && Path.IsPathFullyQualified(privateData))
++            {
++                string flag = Path.Combine(privateData, LegacyFlagFileName);
++                if (fileExists(flag)) return flag;
++            }
++        }
++        catch (Exception)
++        {
++            // An unreadable private data path keeps the default pacing.
++        }
++        return null;
++    }
++}
+diff --git a/src/Ryujinx.Graphics.GAL/FramePresentationTiming.cs b/src/Ryujinx.Graphics.GAL/FramePresentationTiming.cs
+index 80dfb67..e168778 100644
+--- a/src/Ryujinx.Graphics.GAL/FramePresentationTiming.cs
++++ b/src/Ryujinx.Graphics.GAL/FramePresentationTiming.cs
+@@ -7,14 +7,20 @@ namespace Ryujinx.Graphics.GAL;
+ /// Run-local timing carried with one guest presentation frame. Tick values use
+ /// <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/> units and share the
+ /// same process-local Stopwatch clock domain.
++/// GuestQueuedTicks is when the guest queued the buffer (BufferQueueProducer.QueueBuffer),
++/// ComposerAcquiredTicks when the composer tick acquired it, and QueueDepthAtAcquire how many
++/// buffers were queued at that acquire, including this one. Zero when not recorded.
+ /// </summary>
+-[StructLayout(LayoutKind.Sequential, Pack = 8, Size = 40)]
++[StructLayout(LayoutKind.Sequential, Pack = 8, Size = 64)]
+ public readonly record struct FramePresentationTiming(
+     long Sequence,
+     long EnqueuedTicks,
+     long DequeuedTicks,
+     long QueueWaitBeginTicks,
+-    long QueueWaitEndTicks)
++    long QueueWaitEndTicks,
++    long GuestQueuedTicks = 0,
++    long ComposerAcquiredTicks = 0,
++    long QueueDepthAtAcquire = 0)
+ {
+     /// <summary>
+     /// Whether passive frame-phase propagation is enabled for this process.
+diff --git a/src/Ryujinx.Graphics.GAL/PresentationPhaseAlignment.cs b/src/Ryujinx.Graphics.GAL/PresentationPhaseAlignment.cs
+index 42852c8..dff6012 100644
+--- a/src/Ryujinx.Graphics.GAL/PresentationPhaseAlignment.cs
++++ b/src/Ryujinx.Graphics.GAL/PresentationPhaseAlignment.cs
+@@ -5,9 +5,12 @@ using System.Threading;
+ namespace Ryujinx.Graphics.GAL;
+ 
+ // Private 120 Hz experiment. No drawable ownership, frame queue, or input state.
++// The experiment (Enabled) runs only under legacy pacing (DisplayPacing.Legacy). The default pacing uses the
++// display lock below instead, fed by the Metal present path rather than the frame-phase recorder.
+ public static class PresentationPhaseAlignment
+ {
+     public static readonly bool Enabled = OperatingSystem.IsMacOS() && FramePresentationTiming.IsEnabled &&
++        DisplayPacing.Legacy &&
+         Environment.GetEnvironmentVariable("SMASH_COUCH_PHASE_ALIGN") == "1" &&
+         Environment.GetEnvironmentVariable("SMASH_COUCH_PHASE_ALIGN_REFRESH_HZ") == "120";
+ 
+@@ -149,4 +152,87 @@ public static class PresentationPhaseAlignment
+     public static (long FeedbackCount, long Adjustments, long TotalTicks, long MaximumAbsTicks) Statistics =>
+         (Interlocked.Read(ref _feedbackCount), Interlocked.Read(ref _adjustments),
+          Interlocked.Read(ref _totalTicks), Interlocked.Read(ref _maximumAbsTicks));
++
++    // Display lock (default pacing). The Metal present path publishes the refresh grid it verified from
++    // presented-time feedback: the newest on-glass time and the measured refresh period, in Stopwatch
++    // ticks, only while that grid is fresh and 60 or 120 Hz, with the lead to use. The composer then aims
++    // its 60 Hz tick that lead before a refresh, so the frame is committed just in time for it. The lead
++    // starts at DisplayLockLeadSeconds (tick to commit ~0.2 ms, GPU p99.9 ~1.55 ms, latch ~1.5 ms,
++    // residual tick jitter) and the present path lengthens it when frames still miss their refresh.
++    // Without published feedback the timer runs free exactly as before.
++    public const double DisplayLockLeadSeconds = 0.0045;
++
++    private sealed record DisplayGrid(long AnchorTicks, double PeriodTicks, long ObservedTicks, double LeadTicks);
++    private static DisplayGrid _displayGrid;
++    private static long _lockTicks, _lockAdjustments, _lockTotalTicks, _lockMaximumAbsTicks;
++
++    public static void PublishDisplayGrid(long anchorTicks, double periodTicks, long observedTicks) =>
++        PublishDisplayGrid(anchorTicks, periodTicks, observedTicks, Stopwatch.Frequency * DisplayLockLeadSeconds);
++
++    public static void PublishDisplayGrid(long anchorTicks, double periodTicks, long observedTicks, double leadTicks)
++    {
++        if (DisplayPacing.Legacy || anchorTicks <= 0 || observedTicks < anchorTicks || !(periodTicks > 0)) return;
++        Volatile.Write(ref _displayGrid, new DisplayGrid(anchorTicks, periodTicks, observedTicks, leadTicks));
++    }
++
++    public static void InvalidateDisplayGrid() => Volatile.Write(ref _displayGrid, null);
++
++    // Composer thread only.
++    public static long GetDisplayLockCorrection(long nominalDeadline, long now)
++    {
++        DisplayGrid grid = Volatile.Read(ref _displayGrid);
++        if (grid == null) return 0;
++        long correction = CalculateDisplayLockCorrection(nominalDeadline, now, grid.AnchorTicks, grid.ObservedTicks,
++            grid.PeriodTicks, Stopwatch.Frequency, grid.LeadTicks);
++        _lockTicks++;
++        if (correction != 0)
++        {
++            _lockAdjustments++;
++            _lockTotalTicks += correction;
++            _lockMaximumAbsTicks = Math.Max(_lockMaximumAbsTicks, Math.Abs(correction));
++        }
++        return correction;
++    }
++
++    public static long CalculateDisplayLockCorrection(long nominalDeadline, long now, long anchorTicks,
++        long observedTicks, double periodTicks, long frequency) =>
++        CalculateDisplayLockCorrection(nominalDeadline, now, anchorTicks, observedTicks, periodTicks, frequency,
++            frequency * DisplayLockLeadSeconds);
++
++    // Positive means a later next composer tick. Same slew limit (0.10 ms per tick), deadband and
++    // staleness guard (250 ms) as CalculateCorrection, but with the measured refresh period and the
++    // display-lock lead. Zero for stale, future or invalid feedback, a missed or distant deadline, any
++    // refresh rate that does not fit one 60 Hz frame into exactly one or two refreshes (e.g. 144 Hz), and
++    // a lead that is not positive and within one 60 Hz frame.
++    public static long CalculateDisplayLockCorrection(long nominalDeadline, long now, long anchorTicks,
++        long observedTicks, double periodTicks, long frequency, double leadTicks)
++    {
++        if (frequency < 10000 || anchorTicks <= 0 || observedTicks < anchorTicks || now < observedTicks ||
++            nominalDeadline <= now || nominalDeadline - now > frequency / 30 ||
++            now - anchorTicks > frequency / 4 || !IsLockablePeriod(periodTicks, frequency) ||
++            !(leadTicks > 0) || leadTicks > frequency / 60.0) return 0;
++        double lead = leadTicks;
++        double phase = ((nominalDeadline - anchorTicks) + lead) % periodTicks;
++        if (phase < 0) phase += periodTicks;
++        if (phase > periodTicks / 2) phase -= periodTicks;
++        double error = -phase;
++        long limit = frequency / 10000;
++        if (Math.Abs(error) <= limit) return 0;
++        return (long)Math.Clamp(error, -limit, limit);
++    }
++
++    // One emulated 60 Hz frame must span exactly one or two refreshes: 60 or 120 Hz (59.94 and
++    // 119.88 Hz pass; the guest then follows the display clock, 0.1% slow).
++    public static bool IsLockablePeriod(double periodTicks, long frequency)
++    {
++        if (!(periodTicks > 0) || double.IsInfinity(periodTicks) || frequency < 10000) return false;
++        double frame = frequency / 60.0;
++        double refreshes = Math.Round(frame / periodTicks);
++        return (refreshes == 1 || refreshes == 2) && Math.Abs(refreshes * periodTicks - frame) <= frame * 0.005;
++    }
++
++    // Composer-thread counters; read for logging only.
++    public static (long Ticks, long Adjustments, long TotalTicks, long MaximumAbsTicks) DisplayLockStatistics =>
++        (Volatile.Read(ref _lockTicks), Volatile.Read(ref _lockAdjustments),
++         Volatile.Read(ref _lockTotalTicks), Volatile.Read(ref _lockMaximumAbsTicks));
+ }
+diff --git a/src/Ryujinx.Graphics.Gpu/Window.cs b/src/Ryujinx.Graphics.Gpu/Window.cs
+index 91b9df1..e9c50a9 100644
+--- a/src/Ryujinx.Graphics.Gpu/Window.cs
++++ b/src/Ryujinx.Graphics.Gpu/Window.cs
+@@ -131,6 +131,9 @@ namespace Ryujinx.Graphics.Gpu
+         /// <param name="acquireCallback">Texture acquire callback</param>
+         /// <param name="releaseCallback">Texture release callback</param>
+         /// <param name="userObj">User defined object passed to the release callback</param>
++        /// <param name="guestQueuedTicks">Frame-phase diagnostics: Stopwatch time the guest queued the buffer, or 0</param>
++        /// <param name="composerAcquiredTicks">Frame-phase diagnostics: Stopwatch time the composer acquired it, or 0</param>
++        /// <param name="queueDepthAtAcquire">Frame-phase diagnostics: buffers queued at that acquire, or 0</param>
+         /// <exception cref="ArgumentException">Thrown when <paramref name="pid"/> is invalid</exception>
+         /// <returns>True if the frame was added to the queue, false otherwise</returns>
+         public bool EnqueueFrameThreadSafe(
+@@ -146,7 +149,10 @@ namespace Ryujinx.Graphics.Gpu
+             ImageCrop crop,
+             Action<GpuContext, object> acquireCallback,
+             Action<object> releaseCallback,
+-            object userObj)
++            object userObj,
++            long guestQueuedTicks = 0,
++            long composerAcquiredTicks = 0,
++            int queueDepthAtAcquire = 0)
+         {
+             if (!_context.PhysicalMemoryRegistry.TryGetValue(pid, out PhysicalMemory physicalMemory))
+             {
+@@ -194,7 +200,10 @@ namespace Ryujinx.Graphics.Gpu
+                     Stopwatch.GetTimestamp(),
+                     0,
+                     0,
+-                    0);
++                    0,
++                    guestQueuedTicks,
++                    composerAcquiredTicks,
++                    queueDepthAtAcquire);
+             }
+ 
+             _frameQueue.Enqueue(new PresentationTexture(
+diff --git a/source-r16/src/Ryujinx.Graphics.Metal/DisplayRefreshSampler.cs b/src/Ryujinx.Graphics.Metal/DisplayRefreshSampler.cs
+new file mode 100644
+index 0000000..1a9f483
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/DisplayRefreshSampler.cs
+@@ -0,0 +1,110 @@
++using System;
++using System.Diagnostics;
++using System.Runtime.InteropServices;
++using System.Runtime.Versioning;
++using System.Threading;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // The refresh timing of the screen showing the game, for refresh-anchored presents. AppKit is read
++    // on the main thread only: the UI host calls SampleOnMainThread a few times a second with the NSView
++    // that hosts the CAMetalLayer; the render thread reads the newest immutable sample. NSScreen
++    // minimum/maximumRefreshInterval and displayUpdateGranularity are macOS 12+ (checked per call).
++    [SupportedOSPlatform("macos")]
++    public static partial class DisplayRefreshSampler
++    {
++        private const string ObjC = "/usr/lib/libobjc.A.dylib";
++
++        internal sealed record Sample(long SampledTicks, uint ScreenNumber, double MinimumInterval,
++            double MaximumInterval, double Granularity, bool FullScreen);
++
++        private static Sample _latest;
++        private static nint _screenNumberKey;
++
++        internal static Sample Latest => Volatile.Read(ref _latest);
++
++        [LibraryImport(ObjC, StringMarshalling = StringMarshalling.Utf8)]
++        private static partial nint sel_registerName(string name);
++
++        [LibraryImport(ObjC, StringMarshalling = StringMarshalling.Utf8)]
++        private static partial nint objc_getClass(string name);
++
++        [LibraryImport(ObjC, EntryPoint = "objc_msgSend")]
++        private static partial nint SendPointer(nint receiver, nint selector);
++
++        [LibraryImport(ObjC, EntryPoint = "objc_msgSend")]
++        private static partial nint SendPointer(nint receiver, nint selector, nint argument);
++
++        [LibraryImport(ObjC, EntryPoint = "objc_msgSend", StringMarshalling = StringMarshalling.Utf8)]
++        private static partial nint SendString(nint receiver, nint selector, string argument);
++
++        [LibraryImport(ObjC, EntryPoint = "objc_msgSend")]
++        private static partial double SendDouble(nint receiver, nint selector);
++
++        [LibraryImport(ObjC, EntryPoint = "objc_msgSend")]
++        private static partial uint SendUInt(nint receiver, nint selector);
++
++        [LibraryImport(ObjC, EntryPoint = "objc_msgSend")]
++        private static partial nuint SendNUInt(nint receiver, nint selector);
++
++        [LibraryImport(ObjC, EntryPoint = "objc_msgSend")]
++        private static partial byte SendRespondsTo(nint receiver, nint selector, nint query);
++
++        private static readonly nint _window = sel_registerName("window");
++        private static readonly nint _screen = sel_registerName("screen");
++        private static readonly nint _styleMask = sel_registerName("styleMask");
++        private static readonly nint _respondsToSelector = sel_registerName("respondsToSelector:");
++        private static readonly nint _minimumRefreshInterval = sel_registerName("minimumRefreshInterval");
++        private static readonly nint _maximumRefreshInterval = sel_registerName("maximumRefreshInterval");
++        private static readonly nint _displayUpdateGranularity = sel_registerName("displayUpdateGranularity");
++        private static readonly nint _deviceDescription = sel_registerName("deviceDescription");
++        private static readonly nint _objectForKey = sel_registerName("objectForKey:");
++        private static readonly nint _unsignedIntValue = sel_registerName("unsignedIntValue");
++
++        private const nuint FullScreenStyle = 1 << 14; // NSWindowStyleMaskFullScreen
++
++        // Main thread only. A missing window or screen, an old macOS or an ARM64 mismatch publishes an
++        // unusable sample, which keeps the CPU present schedule.
++        public static void SampleOnMainThread(nint nsView)
++        {
++            Sample sample = new(Stopwatch.GetTimestamp(), 0, 0, 0, 0, false);
++            try
++            {
++                nint window = nsView != 0 && RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? SendPointer(nsView, _window) : 0;
++                nint screen = window != 0 ? SendPointer(window, _screen) : 0;
++                if (screen != 0 && SendRespondsTo(screen, _respondsToSelector, _minimumRefreshInterval) != 0 &&
++                    SendRespondsTo(screen, _respondsToSelector, _maximumRefreshInterval) != 0)
++                {
++                    double granularity = SendRespondsTo(screen, _respondsToSelector, _displayUpdateGranularity) != 0
++                        ? SendDouble(screen, _displayUpdateGranularity) : 0;
++                    sample = sample with
++                    {
++                        ScreenNumber = ScreenNumber(screen),
++                        MinimumInterval = SendDouble(screen, _minimumRefreshInterval),
++                        MaximumInterval = SendDouble(screen, _maximumRefreshInterval),
++                        Granularity = granularity,
++                        FullScreen = (SendNUInt(window, _styleMask) & FullScreenStyle) != 0,
++                    };
++                }
++            }
++            catch (Exception)
++            {
++                // Keep the unusable sample.
++            }
++            Volatile.Write(ref _latest, sample);
++        }
++
++        private static uint ScreenNumber(nint screen)
++        {
++            if (_screenNumberKey == 0)
++            {
++                // Owned (+1) and kept for the process lifetime.
++                nint allocated = SendPointer(objc_getClass("NSString"), sel_registerName("alloc"));
++                _screenNumberKey = SendString(allocated, sel_registerName("initWithUTF8String:"), "NSScreenNumber");
++            }
++            nint description = SendPointer(screen, _deviceDescription);
++            nint number = description != 0 && _screenNumberKey != 0 ? SendPointer(description, _objectForKey, _screenNumberKey) : 0;
++            return number != 0 ? SendUInt(number, _unsignedIntValue) : 0;
++        }
++    }
++}
+diff --git a/source-r16/src/Ryujinx.Graphics.Metal/DrawableSizeRequest.cs b/src/Ryujinx.Graphics.Metal/DrawableSizeRequest.cs
+new file mode 100644
+index 0000000..9444a8a
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/DrawableSizeRequest.cs
+@@ -0,0 +1,32 @@
++using System.Threading;
++
++namespace Ryujinx.Graphics.Metal
++{
++    /// <summary>
++    /// Hands a drawable size from the UI thread (resize, full screen, display change) to the render thread, which
++    /// applies it at the next present. Width and height travel in one 64-bit word, so the render thread can never
++    /// take the width of one request with the height of another, and a request is never half consumed.
++    /// </summary>
++    sealed class DrawableSizeRequest
++    {
++        private long _pending;
++
++        public void Request(int width, int height)
++        {
++            Interlocked.Exchange(ref _pending, Pack(width, height));
++        }
++
++        /// <summary>Takes the latest request, if any; a request with a zero or negative side is dropped.</summary>
++        public bool TryTake(out int width, out int height)
++        {
++            long packed = Interlocked.Exchange(ref _pending, 0);
++
++            width = (int)(packed >> 32);
++            height = (int)(uint)packed;
++
++            return width > 0 && height > 0;
++        }
++
++        internal static long Pack(int width, int height) => ((long)width << 32) | (uint)height;
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Metal/PresentPacing.cs b/src/Ryujinx.Graphics.Metal/PresentPacing.cs
+index 0810de0..ed28ea3 100644
+--- a/src/Ryujinx.Graphics.Metal/PresentPacing.cs
++++ b/src/Ryujinx.Graphics.Metal/PresentPacing.cs
+@@ -1,3 +1,5 @@
++using Ryujinx.Common.Logging;
++using Ryujinx.Graphics.GAL;
+ using System;
+ using System.Diagnostics;
+ using System.Globalization;
+@@ -17,6 +19,9 @@ namespace Ryujinx.Graphics.Metal
+     //    has grown is shed one 4.167 ms step per frame.
+     //  - SMASH_COUCH_PRESENT_MIN_MS (1..33, only when the schedule is disabled):
+     //    presentDrawable:afterMinimumDuration:.
++    // Default pacing (not DisplayPacing.Legacy): while a fresh fixed 60/120 Hz refresh grid is
++    // verified from presented-time feedback, the schedule's target is replaced by one aimed at a real
++    // refresh (RefreshAnchoredPacing); otherwise the schedule above continues from the last target.
+     // SharpMetal's wrappers pass the CFTimeInterval in an integer register, so the selectors are
+     // sent directly with the double in d0. Stopwatch and CACurrentMediaTime share mach time.
+     [SupportedOSPlatform("macos")]
+@@ -39,6 +44,8 @@ namespace Ryujinx.Graphics.Metal
+ 
+         // Render-thread only.
+         private static double _lastTarget;
++        private static RefreshAnchoredPacing _anchored;
++        private static bool _anchoredCreated;
+         public static long Resyncs, Sheds, Scheduled;
+ 
+         [LibraryImport(ObjC, StringMarshalling = StringMarshalling.Utf8)]
+@@ -65,16 +72,35 @@ namespace Ryujinx.Graphics.Metal
+             }
+ 
+             double now = Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
+-            double target = _lastTarget + Period;
+-            if (_lastTarget == 0 || target < now + MinimumLead)
++            double target = double.NaN;
++            if (!DisplayPacing.Legacy)
+             {
+-                target = now + ScheduleLead;
+-                Resyncs++;
++                if (!_anchoredCreated)
++                {
++                    _anchoredCreated = true;
++                    _anchored = RefreshAnchoredPacing.TryCreate();
++                }
++                if (_anchored != null) target = _anchored.Target(now, drawable, _lastTarget);
+             }
+-            else if (target > now + ScheduleLead + Step * 1.5)
++            else if (!_anchoredCreated)
+             {
+-                target = Math.Max(now + ScheduleLead, target - Step);
+-                Sheds++;
++                _anchoredCreated = true;
++                Logger.Info?.PrintMsg(LogClass.Gpu, $"[CouchPacing] legacy pacing (CPU present schedule, free-running composer): {DisplayPacing.LegacySource}");
++            }
++
++            if (double.IsNaN(target))
++            {
++                target = _lastTarget + Period;
++                if (_lastTarget == 0 || target < now + MinimumLead)
++                {
++                    target = now + ScheduleLead;
++                    Resyncs++;
++                }
++                else if (target > now + ScheduleLead + Step * 1.5)
++                {
++                    target = Math.Max(now + ScheduleLead, target - Step);
++                    Sheds++;
++                }
+             }
+ 
+             _lastTarget = target;
+@@ -82,6 +108,13 @@ namespace Ryujinx.Graphics.Metal
+             SendDrawableDouble(commandBuffer, _atTime, drawable, target);
+         }
+ 
+-        public static void Reset() => _lastTarget = 0;
++        public static void Reset()
++        {
++            _lastTarget = 0;
++            _anchored?.RequestReset();
++        }
++
++        // The drawable size changed (resize, full-screen transition): re-verify the refresh grid.
++        public static void NoteResize() => _anchored?.RequestHoldOff();
+     }
+ }
+diff --git a/source-r16/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs b/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs
+new file mode 100644
+index 0000000..8787864
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs
+@@ -0,0 +1,459 @@
++using Ryujinx.Graphics.GAL;
++using System;
++using System.Numerics;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Refresh-anchored present decisions: pure arithmetic, no native calls (CPU-tested by
++    // tests/display-pacing). Times are host seconds; Stopwatch, CACurrentMediaTime and
++    // MTLDrawable.presentedTime share mach time. Render thread only.
++    //
++    // Grid: the display's refresh times, anchored on the newest presentedTime of our own drawables, with
++    // the period read from the screen (refined from presented times over about a second). Only fixed
++    // 60 or 120 Hz grids are used; anything else (144 Hz, variable refresh) leaves the CPU schedule.
++    // Each frame aims at the refresh k after the previous frame's (k = 2 at 120 Hz, 1 at 60 Hz), so the
++    // cadence never changes. Its commit margin m (chosen refresh minus now) stays between HoldMargin and
++    // one refresh plus ShedMargin:
++    //  - m < -period/2 (a skipped or stalled frame: no guest frame for a tick, GC pause, catch-up): the
++    //    chain is broken, not tight; re-anchor on the first refresh at least HoldMargin away. Not a
++    //    disturbance for the shed backoff, so hitchy play does not park on the later refresh.
++    //  - m < MissMargin, or on two of the last four frames m < HoldMargin (GPU p99.9 ~1.55 ms + latch
++    //    ~1.5 ms) or the frame was shown after its (near) refresh despite a normal margin: hold one
++    //    refresh later. One hold per drift crossing. A single late commit (1-3 ms short) keeps its
++    //    refresh: it usually still makes it, and if not the next frame is back on cadence.
++    //  - every m of the last ShedAfterFrames frames minus one refresh >= ShedMargin: all of them would
++    //    have made the refresh before, so take it (one short interval). ShedMargin > HoldMargin is the
++    //    hysteresis: a shed can never set up the next hold, and large tick jitter just keeps the later
++    //    refresh. When a hold follows a shed within 30 s (frequent late commits, e.g. loading), the
++    //    clean run needed grows 4x, up to 32 s, so the extra refresh absorbs late commits (up to ~9 ms)
++    //    instead of costing a hold and a shed each; 60 s without a hold or an absorbed late commit
++    //    restores ShedAfterFrames.
++    //  - m > one frame + ShedMargin (composer catch-up burst): one refresh earlier at once. At 60 Hz
++    //    that drops the older frame, so only for a real catch-up (commits under half a frame apart);
++    //    after a hold the clean run above sheds instead, with its backoff.
++    // The present target sits half a refresh plus the ~1.5 ms compositor latch before the chosen
++    // refresh: the middle of the window of targets that show the frame on exactly that refresh.
++    // Composer lock lead (published with the grid): 4.5 ms, so a locked commit is ~4.3 ms before the
++    // near refresh and the present is effectively immediate (target already past); the frame makes it
++    // only if GPU completion plus the compositor latch fits. That latch is unmeasured for such presents,
++    // so the lead adapts (LeadStep, up to MaximumLockLead; back to 4.5 ms on a display change or
++    // transition). Near-refresh frames shown late despite a normal margin raise it one step when two of
++    // them force a hold or three come within LateWindow; so do TightFramesForRaise frames in a row on
++    // the later refresh with too little spare to shed (a commit steadily later than the lead allows).
++    // Self-check: presented times off the grid, frames shown earlier than chosen, and near-refresh
++    // frames shown late at the maximum lead are anomalies; three within 5 s disable the grid for 30 s
++    // (for the session after the third time), which also leaves the composer free-running.
++    internal sealed class PresentRefreshGrid
++    {
++        public const double FramePeriod = 1.0 / 60.0;
++        public const double HoldMargin = 0.003;
++        public const double MissMargin = 0.001;
++        public const double ShedMargin = 0.00325;
++        public const double LatchAllowance = 0.0015;
++        public const double StaleAfter = 0.25;
++        public const int ShedAfterFrames = 32;
++        public const double LeadStep = 0.0005;
++        public const double MaximumLockLead = 0.0075;
++        public const int TightFramesForRaise = 90;
++        private const int MaximumShedAfterFrames = 1920;
++        private const double BackoffWithin = 30.0;
++        private const double BackoffReset = 60.0;
++        private const double LateWindow = 10.0;
++        private const double LeadSettle = 0.5;
++        private const int ConsistentNeeded = 3;
++        private const int History = 64;
++        private const double MarginBinWidth = 0.00025;
++        private const double MarginLow = -0.010;
++
++        private struct Choice
++        {
++            public long Sequence;
++            public long Epoch;
++            public long Window;
++            public double Refresh;
++            public double Margin;
++        }
++
++        private readonly Choice[] _history = new Choice[History];
++        private readonly double[] _anomalies = new double[3];
++
++        private double _nominal, _period;
++        private int _refreshesPerFrame;
++        private bool _compatible;
++
++        private double _anchor, _baseTime;
++        private int _consistent;
++        private long _epoch;
++
++        private double _lastRefresh, _lastChoose, _lastMargin;
++        private int _cleanFrames, _shortMargins, _lateMargins, _pendingLates, _tightFrames, _shedAfter = ShedAfterFrames;
++        private long _window;
++        private double _lastShed = double.NegativeInfinity, _lastDisturbance = double.NegativeInfinity;
++
++        private double _lockLead = PresentationPhaseAlignment.DisplayLockLeadSeconds;
++        private double _lastRaise = double.NegativeInfinity;
++        private readonly double[] _lateEvidence = { double.NegativeInfinity, double.NegativeInfinity };
++
++        private readonly int[] _marginBins = new int[160];
++        private int _marginCount;
++
++        private double _disabledUntil;
++        private int _anomalyCount;
++
++        public long Frames, Entries, Holds, Reanchors, Sheds, BurstSheds, LeadRaises;
++        public long OnTarget, Late, Early, OffGrid, Skipped, Invalid, Disables;
++
++        public double Period => _period;
++        public double Anchor => _anchor;
++        public int RefreshesPerFrame => _refreshesPerFrame;
++        public int ShedAfter => _shedAfter;
++        public double LockLead => _lockLead;
++        public bool Compatible => _compatible;
++        public bool DisabledForSession => double.IsPositiveInfinity(_disabledUntil);
++
++        // A fixed-rate screen: the AppKit refresh range is a single value and the update granularity is that
++        // refresh (or not reported). Variable-refresh and finer-granularity screens keep the CPU schedule.
++        public static bool IsFixedRefresh(double minimumInterval, double maximumInterval, double granularity)
++        {
++            if (!(minimumInterval > 0) || !(maximumInterval > 0) || double.IsInfinity(maximumInterval)) return false;
++            if (Math.Abs(maximumInterval - minimumInterval) > minimumInterval * 0.005) return false;
++            return !(granularity > 0) || Math.Abs(granularity - minimumInterval) <= minimumInterval * 0.01;
++        }
++
++        // Same rule as the composer lock: one 60 Hz frame spans exactly one or two refreshes.
++        public static bool IsCompatible(double period, out int refreshesPerFrame)
++        {
++            refreshesPerFrame = 0;
++            if (!PresentationPhaseAlignment.IsLockablePeriod(period * 1e9, 1_000_000_000)) return false;
++            refreshesPerFrame = (int)Math.Round(FramePeriod / period);
++            return true;
++        }
++
++        // Screen period and whether it is a fixed-rate screen. A change drops all evidence.
++        public void SetDisplay(double period, bool fixedRefresh)
++        {
++            bool compatible = fixedRefresh && IsCompatible(period, out _);
++            if (compatible == _compatible && (!compatible || Math.Abs(period - _nominal) <= _nominal * 0.001)) return;
++            _compatible = compatible;
++            _nominal = compatible ? period : 0;
++            _refreshesPerFrame = 0;
++            if (compatible) IsCompatible(period, out _refreshesPerFrame);
++            InvalidateEvidence();
++        }
++
++        public void InvalidateEvidence()
++        {
++            _anchor = 0;
++            _baseTime = 0;
++            _consistent = 0;
++            _period = _nominal;
++            _epoch++;
++            // A new screen or presentation path (full screen vs composited) has its own latch: re-learn.
++            _lockLead = PresentationPhaseAlignment.DisplayLockLeadSeconds;
++            _lastRaise = double.NegativeInfinity;
++            Array.Fill(_lateEvidence, double.NegativeInfinity);
++            ResetDecisions();
++        }
++
++        // Keep the CPU schedule for a while (window resize, full-screen transition) and re-verify the grid.
++        public void HoldOff(double now, double seconds)
++        {
++            if (!DisabledForSession) _disabledUntil = Math.Max(_disabledUntil, now + seconds);
++            InvalidateEvidence();
++        }
++
++        public void ResetDecisions()
++        {
++            _lastRefresh = 0;
++            ResetWindow();
++        }
++
++        private void ResetWindow()
++        {
++            _cleanFrames = 0;
++            _shortMargins = 0;
++            _lateMargins = 0;
++            _pendingLates = 0;
++            _tightFrames = 0;
++            _window++;
++        }
++
++        public bool IsUsable(double now) => _compatible && _anchor > 0 && _consistent >= ConsistentNeeded &&
++            now - _anchor <= StaleAfter && now >= _disabledUntil;
++
++        // One presented-handler record of our own drawable. presented == 0: never shown (replaced or skipped).
++        public void OnPresented(long sequence, double presented, double now)
++        {
++            if (!double.IsFinite(presented) || presented < 0 || presented > now + 0.001 || (presented > 0 && presented < now - 2.0))
++            {
++                Invalid++;
++                return;
++            }
++            if (presented == 0)
++            {
++                Skipped++;
++                return;
++            }
++            if (!_compatible || DisabledForSession) return;
++
++            if (_anchor > 0)
++            {
++                double offset = presented - _anchor;
++                double residual = offset - Math.Round(offset / _period) * _period;
++                if (Math.Abs(residual) > _period / 8)
++                {
++                    // Not on the grid we aimed at (moved display, mode change, variable timing):
++                    // restart from this sample and stop judging frames chosen on the old grid.
++                    OffGrid++;
++                    _epoch++;
++                    _anchor = presented;
++                    _baseTime = presented;
++                    _consistent = 1;
++                    _period = _nominal;
++                    ResetDecisions();
++                    Anomaly(now);
++                    return;
++                }
++            }
++            else
++            {
++                _baseTime = presented;
++            }
++
++            ref Choice choice = ref _history[(int)(sequence & (History - 1))];
++            if (choice.Sequence == sequence && choice.Epoch == _epoch && choice.Refresh > 0)
++            {
++                double difference = presented - choice.Refresh;
++                if (Math.Abs(difference) <= _period / 4) OnTarget++;
++                else if (difference > 0)
++                {
++                    Late++;
++                    OnLate(choice.Window, choice.Margin, now);
++                }
++                else
++                {
++                    Early++;
++                    Anomaly(now);
++                }
++            }
++
++            _anchor = Math.Max(_anchor, presented);
++            _consistent++;
++
++            // Refine the period over 1-1.5 s of on-grid samples; the screen's nominal value stays the bound.
++            double span = presented - _baseTime;
++            if (span > 1.5) _baseTime = presented;
++            else if (span >= 1.0)
++            {
++                double measured = span / Math.Round(span / _period);
++                if (Math.Abs(measured - _nominal) <= _nominal * 0.002) _period = measured;
++                _baseTime = presented;
++            }
++        }
++
++        // A frame shown after the near refresh it was chosen for although its commit margin was normal: GPU
++        // completion plus the compositor latch outran the lock lead. (A short margin already explains a late
++        // frame and counted when it was chosen; a lead cannot help a frame late for the far refresh.) Within
++        // the current decision window it counts like a short margin; three within LateWindow raise the lead.
++        // Ignored for the lead for LeadSettle after a raise (frames committed before the composer moved).
++        private void OnLate(long window, double margin, double now)
++        {
++            if (margin < HoldMargin || margin >= _period) return;
++            if (window == _window) _pendingLates++;
++            if (now - _lastRaise < LeadSettle) return;
++            if (_lockLead >= MaximumLockLead - 1e-9)
++            {
++                // The longest lead does not fit either: the display does not behave as modelled.
++                Anomaly(now);
++            }
++            else if (now - Math.Min(_lateEvidence[0], _lateEvidence[1]) <= LateWindow)
++            {
++                RaiseLead(now);
++            }
++            else
++            {
++                int older = _lateEvidence[0] <= _lateEvidence[1] ? 0 : 1;
++                _lateEvidence[older] = now;
++            }
++        }
++
++        private void RaiseLead(double now)
++        {
++            if (now - _lastRaise < LeadSettle || _lockLead >= MaximumLockLead - 1e-9) return;
++            _lockLead = Math.Min(_lockLead + LeadStep, MaximumLockLead);
++            _lastRaise = now;
++            Array.Fill(_lateEvidence, double.NegativeInfinity);
++            LeadRaises++;
++        }
++
++        private void Anomaly(double now)
++        {
++            _anomalies[_anomalyCount++ % 3] = now;
++            if (_anomalyCount >= 3 && now - _anomalies[_anomalyCount % 3] <= 5.0)
++            {
++                Disables++;
++                _anomalyCount = 0;
++                HoldOff(now, Disables >= 3 ? double.PositiveInfinity : 30.0);
++            }
++        }
++
++        private double FirstRefreshAtOrAfter(double time)
++        {
++            return _anchor + Math.Ceiling((time - _anchor) / _period - 1e-9) * _period;
++        }
++
++        // Chooses the refresh for a frame committed now and the presentDrawable:atTime: target for it.
++        // previousTarget is the last target sent (either policy), 0 if none. False: use the CPU schedule.
++        public bool TryChoose(double now, double previousTarget, out double refresh, out double target)
++        {
++            refresh = 0;
++            target = 0;
++            if (!IsUsable(now))
++            {
++                ResetDecisions();
++                return false;
++            }
++
++            double period = _period;
++            double frame = period * _refreshesPerFrame;
++            double earliest = FirstRefreshAtOrAfter(now + HoldMargin);
++            if (_lastRefresh > 0)
++            {
++                // Re-express the previous choice on the current anchor; a jump means a different grid.
++                double snapped = _anchor + Math.Round((_lastRefresh - _anchor) / period) * period;
++                _lastRefresh = Math.Abs(snapped - _lastRefresh) <= period / 4 ? snapped : 0;
++            }
++            // A shed may put two frames one refresh apart (k = 2), or on one refresh at 60 Hz (the older is
++            // dropped). Compared with a quarter-refresh tolerance: these are sums of the same doubles.
++            double earliestShed = _lastRefresh + period * (_refreshesPerFrame - 1) - period / 4;
++
++            double choice;
++            if (_lastRefresh <= 0 || now - _lastChoose > StaleAfter)
++            {
++                choice = earliest;
++                if (previousTarget > 0 && now - previousTarget < 0.1)
++                {
++                    // Not on or before the refresh the previous (CPU-scheduled) frame should reach.
++                    choice = Math.Max(choice, FirstRefreshAtOrAfter(previousTarget + LatchAllowance) + period);
++                }
++                Entries++;
++                ResetWindow();
++            }
++            else
++            {
++                choice = _lastRefresh + frame;
++                double margin = choice - now;
++                bool late = _pendingLates > 0;
++                _pendingLates = 0;
++                if (margin < -period / 2)
++                {
++                    choice = earliest;
++                    Reanchors++;
++                    ResetWindow();
++                }
++                else
++                {
++                    _shortMargins = ((_shortMargins << 1) | (margin < HoldMargin || late ? 1 : 0)) & 0xF;
++                    _lateMargins = ((_lateMargins << 1) | (late ? 1 : 0)) & 0xF;
++                    if (margin < MissMargin || BitOperations.PopCount((uint)_shortMargins) >= 2)
++                    {
++                        // Late frames had margins of at least HoldMargin, where earliest is this same refresh.
++                        choice = Math.Max(earliest, choice + period);
++                        Holds++;
++                        if (BitOperations.PopCount((uint)_lateMargins) >= 2) RaiseLead(now);
++                        if (now - _lastShed < BackoffWithin) _shedAfter = Math.Min(_shedAfter * 4, MaximumShedAfterFrames);
++                        _lastDisturbance = now;
++                        ResetWindow();
++                    }
++                    else if (margin > frame + ShedMargin && (_refreshesPerFrame > 1 || now - _lastChoose < frame / 2) &&
++                        choice - period >= earliestShed)
++                    {
++                        choice -= period;
++                        BurstSheds++;
++                        ResetWindow();
++                    }
++                    else
++                    {
++                        if (now - _lastDisturbance > BackoffReset) _shedAfter = ShedAfterFrames;
++                        double spare = margin - period;
++                        if (spare >= ShedMargin) _cleanFrames++;
++                        else
++                        {
++                            // A late commit absorbed by the extra refresh counts as a disturbance too.
++                            if (_cleanFrames > 0) _lastDisturbance = now;
++                            _cleanFrames = 0;
++                        }
++                        // On the later refresh without enough spare to shed, frame after frame: the commit
++                        // comes steadily later than the lead allows, so lengthen the lead.
++                        if (spare >= 0 && spare < ShedMargin)
++                        {
++                            if (++_tightFrames >= TightFramesForRaise)
++                            {
++                                _tightFrames = 0;
++                                RaiseLead(now);
++                            }
++                        }
++                        else _tightFrames = 0;
++                        if (_cleanFrames >= _shedAfter && choice - period >= earliestShed)
++                        {
++                            choice -= period;
++                            Sheds++;
++                            _lastShed = now;
++                            ResetWindow();
++                        }
++                    }
++                }
++            }
++
++            _lastRefresh = choice;
++            _lastChoose = now;
++            _lastMargin = choice - now;
++            CountMargin(_lastMargin);
++            refresh = choice;
++            target = choice - period / 2 - LatchAllowance;
++            Frames++;
++            return true;
++        }
++
++        private void CountMargin(double margin)
++        {
++            int bin = (int)Math.Floor((margin - MarginLow) / MarginBinWidth);
++            _marginBins[Math.Clamp(bin, 0, _marginBins.Length - 1)]++;
++            _marginCount++;
++        }
++
++        // Commit-margin percentiles of the anchored frames since the last call, as 0.25 ms bin centres
++        // (-10..+30 ms, clamped); NaN when there were none. For the periodic log.
++        public (double P1, double P50) TakeMarginPercentiles()
++        {
++            (double, double) result = (MarginPercentile(0.01), MarginPercentile(0.5));
++            Array.Clear(_marginBins);
++            _marginCount = 0;
++            return result;
++        }
++
++        private double MarginPercentile(double p)
++        {
++            if (_marginCount == 0) return double.NaN;
++            long needed = Math.Max(1, (long)Math.Ceiling(p * _marginCount));
++            long seen = 0;
++            for (int i = 0; i < _marginBins.Length; i++)
++            {
++                seen += _marginBins[i];
++                if (seen >= needed) return MarginLow + (i + 0.5) * MarginBinWidth;
++            }
++            return MarginLow + (_marginBins.Length - 0.5) * MarginBinWidth;
++        }
++
++        // Remembers which refresh a registered drawable was aimed at (0: CPU schedule) for the self-check.
++        public void Record(long sequence, double refresh)
++        {
++            ref Choice choice = ref _history[(int)(sequence & (History - 1))];
++            choice.Sequence = sequence;
++            choice.Epoch = _epoch;
++            choice.Window = _window;
++            choice.Refresh = refresh;
++            choice.Margin = refresh > 0 ? _lastMargin : 0;
++        }
++    }
++}
+diff --git a/source-r16/src/Ryujinx.Graphics.Metal/PresentedTimeObserver.cs b/src/Ryujinx.Graphics.Metal/PresentedTimeObserver.cs
+new file mode 100644
+index 0000000..792590d
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/PresentedTimeObserver.cs
+@@ -0,0 +1,50 @@
++using System;
++using System.IO;
++using System.Runtime.InteropServices;
++
++namespace Ryujinx.Graphics.Metal;
++
++// Production presented-time feedback for refresh-anchored presents. Uses the presented-handler bridge
++// already shipped in every runtime bundle (libSmashFramePhase.dylib, the same native observer the
++// frame-phase recorder uses): each registered drawable gets an addPresentedHandler block that only copies
++// scalars into a bounded lock-free ring; no managed code runs on Metal's callback threads and no drawable
++// is retained. One observer per process, created on the render thread, drained only by it (single
++// consumer), and deliberately never closed or destroyed, like the library itself.
++internal sealed unsafe class PresentedTimeObserver
++{
++    private readonly delegate* unmanaged[Cdecl]<nint, nint, ulong, int> _register;
++    private readonly delegate* unmanaged[Cdecl]<nint, FramePhaseEvent*, nuint, nuint> _drain;
++    private readonly nint _observer;
++
++    private PresentedTimeObserver(nint library)
++    {
++        var create = (delegate* unmanaged[Cdecl]<nint>)NativeLibrary.GetExport(library, "PHObserverCreate");
++        var eventSize = (delegate* unmanaged[Cdecl]<nuint>)NativeLibrary.GetExport(library, "PHEventSize");
++        _register = (delegate* unmanaged[Cdecl]<nint, nint, ulong, int>)NativeLibrary.GetExport(library, "PHObserverRegister");
++        _drain = (delegate* unmanaged[Cdecl]<nint, FramePhaseEvent*, nuint, nuint>)NativeLibrary.GetExport(library, "PHObserverDrain");
++        if (sizeof(FramePhaseEvent) != 80 || eventSize() != 80)
++            throw new InvalidDataException("Presented-time C ABI layout mismatch");
++        _observer = create();
++        if (_observer == 0) throw new InvalidOperationException("Cannot allocate presented-time observer");
++    }
++
++    internal static PresentedTimeObserver TryCreate(out string error)
++    {
++        try
++        {
++            nint library = NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, "libSmashFramePhase.dylib"));
++            error = null;
++            return new PresentedTimeObserver(library);
++        }
++        catch (Exception ex)
++        {
++            error = ex.Message;
++            return null;
++        }
++    }
++
++    // Before the drawable is presented. 0 on success.
++    internal int Register(nint drawable, long sequence) => _register(_observer, drawable, (ulong)sequence);
++
++    internal int Drain(FramePhaseEvent* events, int capacity) => (int)_drain(_observer, events, (nuint)capacity);
++}
+diff --git a/source-r16/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs b/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs
+new file mode 100644
+index 0000000..6354416
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs
+@@ -0,0 +1,140 @@
++using Ryujinx.Common.Logging;
++using Ryujinx.Graphics.GAL;
++using System;
++using System.Diagnostics;
++using System.Globalization;
++using System.Runtime.Versioning;
++using System.Threading;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Default present policy (everything except DisplayPacing.Legacy): aims each Switch-vsync frame
++    // at a real display refresh from presented-time feedback (PresentRefreshGrid) and publishes the
++    // verified grid to the composer's display lock. Target returns NaN for a frame that keeps the CPU
++    // schedule: no fresh fixed 60/120 Hz grid yet, a stale screen sample, a resize or full-screen
++    // transition, a screen change, or a disabled grid. Render thread only, except the Request methods.
++    [SupportedOSPlatform("macos")]
++    internal sealed unsafe class RefreshAnchoredPacing
++    {
++        private const double SampleStaleAfter = 2.0;
++        private const double TransitionHoldOff = 0.5;
++        private const double LogInterval = 60.0;
++        private const int DrainBatch = 16;
++
++        private readonly PresentedTimeObserver _observer;
++        private readonly PresentRefreshGrid _grid = new();
++        private DisplayRefreshSampler.Sample _sample;
++        private long _sequence, _registerErrors, _cpuFrames;
++        private int _resetRequested, _holdOffRequested;
++        private bool _anchored;
++        private double _nextLog, _lastLog;
++
++        private RefreshAnchoredPacing(PresentedTimeObserver observer)
++        {
++            _observer = observer;
++        }
++
++        internal static RefreshAnchoredPacing TryCreate()
++        {
++            PresentedTimeObserver observer = PresentedTimeObserver.TryCreate(out string error);
++            if (observer == null)
++            {
++                Logger.Warning?.PrintMsg(LogClass.Gpu, $"[CouchPacing] presented-time feedback unavailable; CPU present schedule only: {error}");
++                return null;
++            }
++            Logger.Info?.PrintMsg(LogClass.Gpu, "[CouchPacing] refresh-anchored presents and display-locked vsync on fixed 60/120 Hz screens");
++            return new RefreshAnchoredPacing(observer);
++        }
++
++        // Any thread: VSync mode change or a skipped presentation.
++        internal void RequestReset() => Volatile.Write(ref _resetRequested, 1);
++
++        // Any thread: the drawable size changed (resize or full-screen transition).
++        internal void RequestHoldOff() => Volatile.Write(ref _holdOffRequested, 1);
++
++        internal double Target(double now, nint drawable, double previousTarget)
++        {
++            if (Interlocked.Exchange(ref _resetRequested, 0) != 0) _grid.ResetDecisions();
++            if (Interlocked.Exchange(ref _holdOffRequested, 0) != 0) _grid.HoldOff(now, TransitionHoldOff);
++
++            UpdateDisplay(now);
++            Drain(now);
++
++            bool anchored = _grid.TryChoose(now, previousTarget, out double refresh, out double target);
++            long sequence = ++_sequence;
++            if (_observer.Register(drawable, sequence) != 0) _registerErrors++;
++            _grid.Record(sequence, anchored ? refresh : 0);
++
++            if (anchored)
++            {
++                PresentationPhaseAlignment.PublishDisplayGrid((long)(_grid.Anchor * Stopwatch.Frequency),
++                    _grid.Period * Stopwatch.Frequency, (long)(now * Stopwatch.Frequency), _grid.LockLead * Stopwatch.Frequency);
++            }
++            else
++            {
++                PresentationPhaseAlignment.InvalidateDisplayGrid();
++                _cpuFrames++;
++            }
++
++            if (now >= _nextLog || (anchored != _anchored && now >= _lastLog + 1.0)) Log(now, anchored);
++            return anchored ? target : double.NaN;
++        }
++
++        private void UpdateDisplay(double now)
++        {
++            DisplayRefreshSampler.Sample sample = DisplayRefreshSampler.Latest;
++            if (sample == null || now - sample.SampledTicks / (double)Stopwatch.Frequency > SampleStaleAfter)
++            {
++                _grid.SetDisplay(0, false);
++                return;
++            }
++            if (!ReferenceEquals(sample, _sample))
++            {
++                if (_sample != null && (sample.ScreenNumber != _sample.ScreenNumber || sample.FullScreen != _sample.FullScreen))
++                {
++                    _grid.HoldOff(now, TransitionHoldOff);
++                }
++                _sample = sample;
++            }
++            _grid.SetDisplay(sample.MinimumInterval,
++                PresentRefreshGrid.IsFixedRefresh(sample.MinimumInterval, sample.MaximumInterval, sample.Granularity));
++        }
++
++        private void Drain(double now)
++        {
++            FramePhaseEvent* events = stackalloc FramePhaseEvent[DrainBatch];
++            for (int round = 0; round < 8; round++)
++            {
++                int count = _observer.Drain(events, DrainBatch);
++                for (int i = 0; i < count; i++)
++                {
++                    if (events[i].CallbackDrawableId == events[i].ExpectedDrawableId)
++                    {
++                        _grid.OnPresented((long)events[i].Sequence, events[i].PresentedTime, now);
++                    }
++                }
++                if (count < DrainBatch) break;
++            }
++        }
++
++        private void Log(double now, bool anchored)
++        {
++            _anchored = anchored;
++            _lastLog = now;
++            _nextLog = now + LogInterval;
++            PresentRefreshGrid g = _grid;
++            var lockStats = PresentationPhaseAlignment.DisplayLockStatistics;
++            var margins = g.TakeMarginPercentiles();
++            double ms = 1000.0 / Stopwatch.Frequency;
++            Logger.Info?.PrintMsg(LogClass.Gpu, string.Create(CultureInfo.InvariantCulture,
++                $"[CouchPacing] mode={(anchored ? "anchored" : "cpu")};refreshHz={(g.Period > 0 ? 1 / g.Period : 0):F4};k={g.RefreshesPerFrame};" +
++                $"screen={_sample?.ScreenNumber};fullScreen={_sample?.FullScreen};sessionOff={g.DisabledForSession};" +
++                $"leadMs={g.LockLead * 1000:F1};leadRaises={g.LeadRaises};marginP1Ms={margins.P1 * 1000:F2};marginP50Ms={margins.P50 * 1000:F2};" +
++                $"frames={g.Frames};cpuFrames={_cpuFrames};entries={g.Entries};holds={g.Holds};reanchors={g.Reanchors};" +
++                $"sheds={g.Sheds};burstSheds={g.BurstSheds};shedAfter={g.ShedAfter};onTarget={g.OnTarget};late={g.Late};early={g.Early};" +
++                $"offGrid={g.OffGrid};skipped={g.Skipped};invalid={g.Invalid};disables={g.Disables};registerErrors={_registerErrors};" +
++                $"lockTicks={lockStats.Ticks};lockAdjustments={lockStats.Adjustments};lockTotalMs={lockStats.TotalTicks * ms:F3};" +
++                $"lockMaxMs={lockStats.MaximumAbsTicks * ms:F3}"));
++        }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Metal/Window.cs b/src/Ryujinx.Graphics.Metal/Window.cs
+index 8b03a13..7732af3 100644
+--- a/src/Ryujinx.Graphics.Metal/Window.cs
++++ b/src/Ryujinx.Graphics.Metal/Window.cs
+@@ -23,8 +23,8 @@ namespace Ryujinx.Graphics.Metal
+         private int _width;
+         private int _height;
+ 
+-        private int _requestedWidth;
+-        private int _requestedHeight;
++        // Written on the UI thread, applied on the render thread at the next present.
++        private readonly DrawableSizeRequest _requestedSize = new();
+         
+         private AntiAliasing _currentAntiAliasing;
+         private bool _updateEffect;
+@@ -50,15 +50,12 @@ namespace Ryujinx.Graphics.Metal
+ 
+         private void ResizeIfNeeded()
+         {
+-            if (_requestedWidth != 0 && _requestedHeight != 0)
++            if (_requestedSize.TryTake(out int width, out int height))
+             {
+                 // TODO: This is actually a CGSize, but there is no overload for that, so fill the first two fields of rect with the size.
+-                NSRect rect = new(_requestedWidth, _requestedHeight, 0, 0);
++                NSRect rect = new(width, height, 0, 0);
+ 
+                 ObjectiveC.objc_msgSend(_metalLayer, "setDrawableSize:", rect);
+-
+-                _requestedWidth = 0;
+-                _requestedHeight = 0;
+             }
+         }
+ 
+@@ -112,8 +109,15 @@ namespace Ryujinx.Graphics.Metal
+                 }
+ 
+                 long drawableAcquired = backendBegin != 0 ? Stopwatch.GetTimestamp() : 0;
+-                _width = (int)drawable.Texture.Width;
+-                _height = (int)drawable.Texture.Height;
++                int drawableWidth = (int)drawable.Texture.Width;
++                int drawableHeight = (int)drawable.Texture.Height;
++                if (_width != 0 && (drawableWidth != _width || drawableHeight != _height))
++                {
++                    // Resize or full-screen transition: the present pacing re-verifies the refresh grid.
++                    PresentPacing.NoteResize();
++                }
++                _width = drawableWidth;
++                _height = drawableHeight;
+ 
+                 UpdateEffect();
+ 
+@@ -186,8 +190,7 @@ namespace Ryujinx.Graphics.Metal
+ 
+         public void SetSize(int width, int height)
+         {
+-            _requestedWidth = width;
+-            _requestedHeight = height;
++            _requestedSize.Request(width, height);
+         }
+         
+         public void ChangeVSyncMode(VSyncMode vSyncMode)
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueConsumer.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueConsumer.cs
+index 74afa98..860c106 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueConsumer.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueConsumer.cs
+@@ -52,6 +52,11 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+ 
+                 bufferItem = Core.Queue[0];
+ 
++                if (Ryujinx.Graphics.GAL.FramePresentationTiming.IsEnabled)
++                {
++                    bufferItem.HostQueueDepth = Core.Queue.Count;
++                }
++
+                 if (Core.StillTracking(ref bufferItem))
+                 {
+                     Core.Slots[bufferItem.Slot].AcquireCalled = true;
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs
+index e495e82..0b7d62c 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs
+@@ -411,6 +411,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                 item.Slot = slot;
+                 item.Fence = input.Fence;
+                 item.IsDroppable = Core.DequeueBufferCannotBlock || input.Async != 0;
++                item.HostQueuedTicks = Ryujinx.Graphics.GAL.FramePresentationTiming.IsEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+ 
+                 item.GraphicBuffer.Set(Core.Slots[slot].GraphicBuffer);
+                 item.GraphicBuffer.Object.IncrementNvMapHandleRefCount(Core.Owner);
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/SurfaceFlinger.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/SurfaceFlinger.cs
+index 29fe3a8..eef66b2 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/SurfaceFlinger.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/SurfaceFlinger.cs
+@@ -28,6 +28,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+         private long _ticks;
+         private long _ticksPerFrame;
+         private readonly long _spinTicks;
++        private readonly long _spinLeadTicks;
+         private readonly long _1msTicks;
+ 
+         private VSyncMode _vSyncMode;
+@@ -70,6 +71,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+ 
+             _ticks = 0;
+             _spinTicks = Stopwatch.Frequency / 500;
++            _spinLeadTicks = Stopwatch.Frequency * 3 / 2000;
+             _1msTicks = Stopwatch.Frequency / 1000;
+ 
+             UpdateSwapInterval(1);
+@@ -336,10 +338,22 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                         // Apply a maximum bound of 3 frames to the tick remainder, in case some event causes Ryujinx to pause for a long time or messes with the timer.
+                         _ticks = Math.Min(_ticks - _ticksPerFrame, _ticksPerFrame * 3);
+ 
++                        if (!DisplayPacing.Legacy)
++                        {
++                            // Default pacing: keep the normal 60 Hz cadence, locked (at most 0.1 ms per
++                            // tick) to the display refresh grid the Metal present path verified. Without
++                            // fresh 60/120 Hz feedback the correction is zero and the timer runs free.
++                            if (_swapInterval == 1 && _device.VSyncMode == VSyncMode.Switch && _device.TargetVSyncInterval == 60)
++                            {
++                                long nominalDeadline = ticks + _ticksPerFrame - _ticks;
++                                _ticks -= PresentationPhaseAlignment.GetDisplayLockCorrection(
++                                    nominalDeadline, PerformanceCounter.ElapsedTicks);
++                            }
++                        }
+                         // Exact opt-in experiment: keep the normal 60 Hz cadence,
+                         // gradually align its phase with observed native display edges.
+                         // Missing/stale feedback preserves the existing timer.
+-                        if (PresentationPhaseAlignment.OpportunityTraceEnabled)
++                        else if (PresentationPhaseAlignment.OpportunityTraceEnabled)
+                         {
+                             int swapInterval = _swapInterval;
+                             bool vSyncModeSwitch = _device.VSyncMode == VSyncMode.Switch;
+@@ -363,7 +377,23 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+ 
+                     // Sleep if possible. If the time til the next frame is too low, spin wait instead.
+                     long diff = _ticksPerFrame - (_ticks + PerformanceCounter.ElapsedTicks - ticks);
+-                    if (diff > 0)
++                    if (diff > 0 && !DisplayPacing.Legacy)
++                    {
++                        // Default pacing: timed waits on macOS wake up to ~1.5 ms late, which made the
++                        // tick jitter by about +/-1.5 ms. Sleep until 1.5 ms before the tick, then spin
++                        // the rest (at most 2 ms per frame); an early wake just sleeps again next loop.
++                        long deadline = PerformanceCounter.ElapsedTicks + diff;
++                        if (diff > _spinLeadTicks)
++                        {
++                            PreciseSleepHelper.SleepUntilTimePoint(_event, deadline - _spinLeadTicks);
++                        }
++
++                        if (deadline - PerformanceCounter.ElapsedTicks < _spinTicks)
++                        {
++                            PreciseSleepHelper.SpinWaitUntilTimePoint(deadline);
++                        }
++                    }
++                    else if (diff > 0)
+                     {
+                         PreciseSleepHelper.SleepUntilTimePoint(_event, PerformanceCounter.ElapsedTicks + diff);
+ 
+@@ -395,6 +425,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                 Layer layer = GetLayerByIdLocked(RenderLayerId);
+ 
+                 Status acquireStatus = layer.Consumer.AcquireBuffer(out BufferItem item, 0);
++                long acquiredTicks = FramePresentationTiming.IsEnabled ? PerformanceCounter.ElapsedTicks : 0;
+ 
+                 if (acquireStatus == Status.Success)
+                 {
+@@ -416,7 +447,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                         UpdateSwapInterval(item.SwapInterval);
+                     }
+ 
+-                    PostFrameBuffer(layer, item);
++                    PostFrameBuffer(layer, item, acquiredTicks);
+                 }
+                 else if (acquireStatus != Status.NoBufferAvailaible && acquireStatus != Status.InvalidOperation)
+                 {
+@@ -425,7 +456,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+             }
+         }
+ 
+-        private void PostFrameBuffer(Layer layer, BufferItem item)
++        private void PostFrameBuffer(Layer layer, BufferItem item, long acquiredTicks)
+         {
+             int frameBufferWidth = item.GraphicBuffer.Object.Width;
+             int frameBufferHeight = item.GraphicBuffer.Object.Height;
+@@ -490,7 +521,10 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                 crop,
+                 AcquireBuffer,
+                 ReleaseBuffer,
+-                textureCallbackInformation))
++                textureCallbackInformation,
++                item.HostQueuedTicks,
++                acquiredTicks,
++                item.HostQueueDepth))
+             {
+                 if (item.Fence.FenceCount == 0)
+                 {
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/Types/BufferItem.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/Types/BufferItem.cs
+index dc752da..22fbec6 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/Types/BufferItem.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/Types/BufferItem.cs
+@@ -19,6 +19,10 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+         public bool AcquireCalled;
+         public bool TransformToDisplayInverse;
+ 
++        // Host-side diagnostics (frame-phase only): Stopwatch time of QueueBuffer and the queue depth seen at acquire.
++        public long HostQueuedTicks;
++        public int HostQueueDepth;
++
+         public BufferItem()
+         {
+             GraphicBuffer = new AndroidStrongPointer<GraphicBuffer>();
+@@ -53,6 +57,8 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                 SwapInterval = SwapInterval,
+                 Fence = Fence,
+                 Crop = Crop,
++                HostQueuedTicks = HostQueuedTicks,
++                HostQueueDepth = HostQueueDepth,
+             };
+ 
+             item.GraphicBuffer.Set(GraphicBuffer);
+diff --git a/source-r16/tests/couch-window/.gitignore b/tests/couch-window/.gitignore
+new file mode 100644
+index 0000000..a1e0396
+--- /dev/null
++++ b/tests/couch-window/.gitignore
+@@ -0,0 +1 @@
++runs/
+diff --git a/source-r16/tests/couch-window/CouchWindowTests.csproj b/tests/couch-window/CouchWindowTests.csproj
+new file mode 100644
+index 0000000..8f3ac0c
+--- /dev/null
++++ b/tests/couch-window/CouchWindowTests.csproj
+@@ -0,0 +1,22 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <!-- Offline console harness for the r16-ui full-screen and couch-safety rules: the pure policy and the Metal
++       drawable-size handoff (linked from src, unchanged), plus Avalonia 11.0.13's own binding behaviour for
++       Window.WindowStateProperty, which the two-way full-screen sync relies on. Build with build-and-run.sh. -->
++  <PropertyGroup>
++    <OutputType>Exe</OutputType>
++    <AssemblyName>CouchWindowTests</AssemblyName>
++    <RuntimeIdentifier>osx-arm64</RuntimeIdentifier>
++    <ImplicitUsings>disable</ImplicitUsings><Nullable>disable</Nullable>
++    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
++  </PropertyGroup>
++  <ItemGroup>
++    <!-- Version from Directory.Packages.props (the one the app ships). -->
++    <PackageReference Include="Avalonia" />
++  </ItemGroup>
++  <ItemGroup>
++    <Compile Include="../../src/Ryujinx/UI/Helpers/CouchWindowPolicy.cs" Link="Linked/CouchWindowPolicy.cs" />
++    <Compile Include="../../src/Ryujinx/Common/KeyboardHotkeyState.cs" Link="Linked/KeyboardHotkeyState.cs" />
++    <Compile Include="../../src/Ryujinx.Graphics.Metal/DrawableSizeRequest.cs" Link="Linked/DrawableSizeRequest.cs" />
++    <Compile Include="Program.cs" />
++  </ItemGroup>
++</Project>
+diff --git a/source-r16/tests/couch-window/Program.cs b/tests/couch-window/Program.cs
+new file mode 100644
+index 0000000..7a89223
+--- /dev/null
++++ b/tests/couch-window/Program.cs
+@@ -0,0 +1,395 @@
++// r16-ui full-screen and couch-safety rules: CouchWindowPolicy (linked from src), the Metal DrawableSizeRequest
++// (linked from src) and the Avalonia 11.0.13 binding behaviour the two-way WindowState sync depends on.
++using Avalonia;
++using Avalonia.Controls;
++using Avalonia.Data;
++using Avalonia.Data.Core;
++using Avalonia.Markup.Xaml.MarkupExtensions;
++using Avalonia.Markup.Xaml.MarkupExtensions.CompiledBindings;
++using Ryujinx.Ava.Common;
++using Ryujinx.Ava.UI.Helpers;
++using Ryujinx.Graphics.Metal;
++using System;
++using System.ComponentModel;
++using System.Linq;
++using System.Threading;
++using Chrome = Ryujinx.Ava.UI.Helpers.CouchWindowPolicy.Chrome;
++using Escape = Ryujinx.Ava.UI.Helpers.CouchWindowPolicy.EscapeAction;
++
++static class CouchWindowTests
++{
++    static int _checks;
++    static int _failures;
++
++    static void Check(bool ok, string label)
++    {
++        _checks++;
++        if (!ok) _failures++;
++        Console.WriteLine((ok ? "OK   " : "FAIL ") + label);
++    }
++
++    static readonly WindowState[] States = [WindowState.Normal, WindowState.Minimized, WindowState.Maximized, WindowState.FullScreen];
++
++    // Stand-ins for MainWindowViewModel (WindowState, IsFullScreen, chrome) and MainWindow (WindowStateProperty).
++    sealed class Vm : INotifyPropertyChanged
++    {
++        WindowState _state;
++        public WindowState WindowState { get => _state; set { if (_state == value) return; _state = value; Raise(nameof(WindowState)); } }
++        public bool IsFullScreen, TitleExtends, Menu = true, GameRunning = true, Couch;
++        public int ChromeApplications;
++        public event PropertyChangedEventHandler PropertyChanged;
++        void Raise(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
++
++        // Same steps as MainWindowViewModel.ApplyWindowStateChrome.
++        public void ApplyWindowStateChrome(WindowState state)
++        {
++            if (CouchWindowPolicy.ChromeFor(state, IsFullScreen, GameRunning, true, Couch) is not { } c) return;
++            ChromeApplications++;
++            IsFullScreen = c.IsFullScreen;
++            TitleExtends = c.ExtendsContentIntoTitleBar;
++            if (c.ShowMenuAndStatusBar is bool m) Menu = CouchWindowPolicy.MenuAndStatusBarVisible(m, Couch);
++        }
++
++        // Same steps as MainWindowViewModel.ToggleFullscreen, without the debounce.
++        public void ToggleFullscreen() => WindowState = CouchWindowPolicy.NextFullscreenState(WindowState);
++    }
++
++    sealed class FakeWindow : AvaloniaObject
++    {
++        public static readonly StyledProperty<WindowState> WindowStateProperty = Window.WindowStateProperty.AddOwner<FakeWindow>();
++        public WindowState WindowState { get => GetValue(WindowStateProperty); set => SetValue(WindowStateProperty, value); }
++    }
++
++    static BindingBase CompiledWindowStateBinding(Vm vm, BindingMode mode)
++    {
++        // What the XAML compiler emits for WindowState="{Binding WindowState, Mode=...}" with compiled bindings.
++        CompiledBindingPath path = new CompiledBindingPathBuilder()
++            .Property(new ClrPropertyInfo(nameof(Vm.WindowState), o => ((Vm)o).WindowState, (o, v) => ((Vm)o).WindowState = (WindowState)v, typeof(WindowState)),
++                PropertyInfoAccessorFactory.CreateInpcPropertyAccessor)
++            .Build();
++
++        return new CompiledBindingExtension(path) { Mode = mode, Source = vm };
++    }
++
++    // MainWindow: the binding from MainWindow.axaml plus the observer from the MainWindow constructor.
++    static (Vm Vm, FakeWindow Window) Wire(BindingMode mode, bool couch, bool compiled = true)
++    {
++        Vm vm = new() { Couch = couch, Menu = CouchWindowPolicy.MenuAndStatusBarVisible(true, couch) };
++        FakeWindow window = new();
++        window.Bind(FakeWindow.WindowStateProperty, compiled ? CompiledWindowStateBinding(vm, mode) : new Binding(nameof(Vm.WindowState)) { Source = vm, Mode = mode });
++        window.GetPropertyChangedObservable(FakeWindow.WindowStateProperty)
++            .Subscribe(new Observer(change => vm.ApplyWindowStateChrome((WindowState)change.NewValue!)));
++        return (vm, window);
++    }
++
++    sealed class Observer(Action<AvaloniaPropertyChangedEventArgs> next) : IObserver<AvaloniaPropertyChangedEventArgs>
++    {
++        public void OnNext(AvaloniaPropertyChangedEventArgs value) => next(value);
++        public void OnError(Exception error) => throw error;
++        public void OnCompleted() { }
++    }
++
++    static bool Consistent(Vm vm, FakeWindow window, bool fullScreen) =>
++        window.WindowState is WindowState.FullScreen == fullScreen &&
++        vm.WindowState == window.WindowState &&
++        vm.IsFullScreen == fullScreen &&
++        vm.TitleExtends == fullScreen &&
++        vm.Menu == CouchWindowPolicy.MenuAndStatusBarVisible(!fullScreen, vm.Couch);
++
++    static void AvaloniaBinding()
++    {
++        Check(Window.WindowStateProperty.GetMetadata(typeof(Window)).DefaultBindingMode == BindingMode.OneWay,
++            "avalonia: Window.WindowState binds one-way by default (why the old binding went stale)");
++
++        foreach (bool compiled in new[] { true, false })
++        {
++            string kind = compiled ? "compiled" : "reflection";
++
++            // The old XAML: a native change (Window.HandleWindowStateChanged sets the property) never reaches the VM.
++            (Vm oneWayVm, FakeWindow oneWay) = Wire(BindingMode.OneWay, couch: true, compiled);
++            oneWay.WindowState = WindowState.FullScreen;
++            Check(oneWayVm.WindowState == WindowState.Normal, $"{kind} one-way: native enter leaves the VM stale (the reported desync)");
++            oneWayVm.ToggleFullscreen();
++            Check(oneWay.WindowState == WindowState.FullScreen && oneWayVm.WindowState == WindowState.FullScreen,
++                $"{kind} one-way: first Ctrl+Cmd+F after a native enter is a visible no-op");
++
++            (Vm vm, FakeWindow window) = Wire(BindingMode.TwoWay, couch: true, compiled);
++            Check(Consistent(vm, window, false), $"{kind} two-way: starts windowed and consistent");
++
++            window.WindowState = WindowState.FullScreen; // green button / Mission Control / AXFullScreen / Fn+F via AppKit
++            Check(vm.WindowState == WindowState.FullScreen && Consistent(vm, window, true), $"{kind} two-way: native enter reaches the VM and the chrome");
++
++            vm.ToggleFullscreen(); // Ctrl+Cmd+F, F11, Option-Return, Escape
++            Check(window.WindowState == WindowState.Normal && Consistent(vm, window, false), $"{kind} two-way: first toggle after a native enter leaves full screen");
++
++            window.SetCurrentValue(FakeWindow.WindowStateProperty, WindowState.FullScreen);
++            Check(Consistent(vm, window, true), $"{kind} two-way: SetCurrentValue from the platform also reaches the VM");
++
++            window.WindowState = WindowState.Normal; // native exit
++            Check(Consistent(vm, window, false), $"{kind} two-way: native exit reaches the VM and the chrome");
++
++            vm.ToggleFullscreen();
++            Check(window.WindowState == WindowState.FullScreen && Consistent(vm, window, true), $"{kind} two-way: binding still alive after local sets (VM -> window)");
++
++            // A refused toggle: AppKit ignores the exit during its animation and reports full screen again at the end.
++            vm.ToggleFullscreen();
++            window.WindowState = WindowState.FullScreen;
++            Check(vm.WindowState == WindowState.FullScreen && Consistent(vm, window, true), $"{kind} two-way: a refused toggle converges on the real state");
++
++            int before = vm.ChromeApplications;
++            window.WindowState = WindowState.FullScreen;
++            vm.WindowState = WindowState.FullScreen;
++            Check(vm.ChromeApplications == before, $"{kind} two-way: equal values cause no chrome re-application (no feedback loop)");
++
++            window.WindowState = WindowState.Minimized;
++            Check(vm.IsFullScreen && vm.TitleExtends && vm.WindowState == WindowState.Minimized, $"{kind} two-way: minimizing keeps the chrome");
++
++            // A zoomed windowed game (Magnet, title-bar double-click, Option-green button): Avalonia reports Maximized
++            // whenever -[NSWindow isZoomed], and the first shortcut must enter full screen, not un-zoom.
++            (Vm zoomVm, FakeWindow zoomed) = Wire(BindingMode.TwoWay, couch: true, compiled);
++            zoomed.WindowState = WindowState.Maximized; // native zoom
++            Check(zoomVm.WindowState == WindowState.Maximized && Consistent(zoomVm, zoomed, false), $"{kind} two-way: native zoom reaches the VM");
++            zoomVm.ToggleFullscreen();
++            Check(zoomed.WindowState == WindowState.FullScreen && Consistent(zoomVm, zoomed, true), $"{kind} two-way: first toggle from a zoomed window enters full screen");
++            zoomVm.ToggleFullscreen();
++            Check(zoomed.WindowState == WindowState.Normal && Consistent(zoomVm, zoomed, false), $"{kind} two-way: toggle leaves full screen");
++            zoomed.WindowState = WindowState.Maximized; // windowDidExitFullScreen: AppKit restored the zoomed frame
++            Check(zoomVm.WindowState == WindowState.Maximized && Consistent(zoomVm, zoomed, false), $"{kind} two-way: the restored zoomed frame reaches the VM");
++            zoomVm.ToggleFullscreen();
++            Check(zoomed.WindowState == WindowState.FullScreen && Consistent(zoomVm, zoomed, true), $"{kind} two-way: every cycle re-enters full screen with one press");
++
++            // --fullscreen (SwitchToGameControl / ShowLoading) when the window starts zoomed (window_maximized, or a
++            // frame clamped to a small display).
++            (Vm startVm, FakeWindow start) = Wire(BindingMode.TwoWay, couch: true, compiled);
++            startVm.WindowState = WindowState.Maximized;
++            if (startVm.WindowState is not WindowState.FullScreen)
++            {
++                startVm.ToggleFullscreen();
++            }
++            Check(start.WindowState == WindowState.FullScreen && Consistent(startVm, start, true), $"{kind} two-way: --fullscreen from a zoomed start opens full screen");
++        }
++
++        (Vm desk, FakeWindow deskWindow) = Wire(BindingMode.TwoWay, couch: false);
++        deskWindow.WindowState = WindowState.FullScreen;
++        Check(!desk.Menu && Consistent(desk, deskWindow, true), "outside couch: full screen hides the menu");
++        deskWindow.WindowState = WindowState.Normal;
++        Check(desk.Menu && Consistent(desk, deskWindow, false), "outside couch: leaving full screen shows the menu again (upstream behaviour)");
++        deskWindow.WindowState = WindowState.Maximized;
++        Check(desk.ChromeApplications == 2, "outside couch: zooming a windowed game does not touch the chrome");
++    }
++
++    static void ChromeTable()
++    {
++        foreach (WindowState state in States)
++        foreach (bool was in new[] { false, true })
++        foreach (bool running in new[] { false, true })
++        foreach (bool titleBar in new[] { false, true })
++        foreach (bool couch in new[] { false, true })
++        {
++            Chrome? c = CouchWindowPolicy.ChromeFor(state, was, running, titleBar, couch);
++            bool fs = state is WindowState.FullScreen;
++            string label = $"chrome {state} was={was} running={running} titleBar={titleBar} couch={couch}";
++
++            if (state is WindowState.Minimized || fs == was)
++            {
++                Check(c is null, label + " -> unchanged");
++                continue;
++            }
++
++            bool? menu = running ? !fs && !couch : null;
++            Check(c is { } v && v.IsFullScreen == fs && v.ExtendsContentIntoTitleBar == (fs || !titleBar) && v.ShowMenuAndStatusBar == menu,
++                label + $" -> fs={fs} extends={fs || !titleBar} menu={menu?.ToString() ?? "keep"}");
++        }
++
++        Check(!CouchWindowPolicy.MenuAndStatusBarVisible(true, true) && !CouchWindowPolicy.MenuAndStatusBarVisible(false, true),
++            "couch: the menu and status bar never show");
++        Check(CouchWindowPolicy.MenuAndStatusBarVisible(true, false) && !CouchWindowPolicy.MenuAndStatusBarVisible(false, false),
++            "outside couch: the menu follows the request");
++    }
++
++    static void Toggle()
++    {
++        Check(CouchWindowPolicy.NextFullscreenState(WindowState.Normal) == WindowState.FullScreen, "toggle: Normal -> FullScreen");
++        Check(CouchWindowPolicy.NextFullscreenState(WindowState.FullScreen) == WindowState.Normal, "toggle: FullScreen -> Normal");
++        Check(CouchWindowPolicy.NextFullscreenState(WindowState.Maximized) == WindowState.FullScreen,
++            "toggle: Maximized (zoomed window) -> FullScreen, not an un-zoom (upstream went to Normal)");
++        Check(CouchWindowPolicy.NextFullscreenState(WindowState.Minimized) == WindowState.FullScreen,
++            "toggle: Minimized -> FullScreen (--fullscreen while minimized during load, as the one-way VM did)");
++        foreach (WindowState state in States)
++        {
++            Check((CouchWindowPolicy.NextFullscreenState(state) is WindowState.FullScreen) != (state is WindowState.FullScreen),
++                $"toggle: {state} -> {(state is WindowState.FullScreen ? "leaves" : "enters")} full screen");
++        }
++        Check(CouchWindowPolicy.FullscreenToggleDelayMs >= 900, "toggle: debounce covers the AppKit animation (>= 900 ms)");
++        Check(CouchWindowPolicy.ToggleDebounced(10_000 + CouchWindowPolicy.FullscreenToggleDelayMs - 1, 10_000), "toggle: a press inside the debounce is ignored");
++        Check(!CouchWindowPolicy.ToggleDebounced(10_000 + CouchWindowPolicy.FullscreenToggleDelayMs, 10_000), "toggle: a press after the debounce is taken");
++        long now = Environment.TickCount64;
++        Check(!CouchWindowPolicy.ToggleDebounced(now, now - CouchWindowPolicy.FullscreenToggleDelayMs),
++            "toggle: the first toggle (--fullscreen right after the window opens) is never debounced");
++    }
++
++    static void EscapeTable()
++    {
++        foreach (WindowState state in States)
++        foreach (bool running in new[] { false, true })
++        foreach (bool confirm in new[] { false, true })
++        foreach (bool couch in new[] { false, true })
++        {
++            Escape action = CouchWindowPolicy.ForEscape(state, running, confirm, couch);
++            Escape expected = state is WindowState.FullScreen ? Escape.LeaveFullScreen
++                : running && confirm && !couch ? Escape.ShowExitPrompt : Escape.None;
++            Check(action == expected, $"escape {state} running={running} confirm={confirm} couch={couch} -> {expected}");
++        }
++
++        // The cases that ended couch matches before: windowed, exit prompt off.
++        Check(CouchWindowPolicy.ForEscape(WindowState.Normal, true, false, true) == Escape.None, "escape: couch, windowed, prompt off never stops the game");
++        Check(CouchWindowPolicy.ForEscape(WindowState.Normal, true, false, false) == Escape.None, "escape: prompt off never stops the game outside couch either");
++    }
++
++    static void Hotkeys()
++    {
++        KeyboardHotkeyState[] blocked =
++        [
++            KeyboardHotkeyState.ToggleVSyncMode, KeyboardHotkeyState.ShowUI, KeyboardHotkeyState.Pause,
++            KeyboardHotkeyState.ResScaleUp, KeyboardHotkeyState.ResScaleDown,
++            KeyboardHotkeyState.CustomVSyncIntervalIncrement, KeyboardHotkeyState.CustomVSyncIntervalDecrement,
++        ];
++
++        foreach (KeyboardHotkeyState state in Enum.GetValues<KeyboardHotkeyState>())
++        {
++            bool expected = !blocked.Contains(state);
++            Check(CouchWindowPolicy.AllowsHotkey(state, true) == expected, $"hotkey couch {state} -> {(expected ? "allowed" : "blocked")}");
++            Check(CouchWindowPolicy.AllowsHotkey(state, false), $"hotkey outside couch {state} -> allowed");
++        }
++
++        Check(!CouchWindowPolicy.AllowsDockedModeToggle(true) && CouchWindowPolicy.AllowsDockedModeToggle(false), "F9 docked toggle: off in couch only");
++        Check(!CouchWindowPolicy.AllowsCacheLoadCancel(true) && CouchWindowPolicy.AllowsCacheLoadCancel(false), "Delete cache-load cancel: off in couch only");
++    }
++
++    static void GlobeF()
++    {
++        const ulong fn = 1UL << 23, shift = 1UL << 17, control = 1UL << 18, option = 1UL << 19, command = 1UL << 20, caps = 1UL << 16;
++        const ulong keyDown = 10, keyUp = 11;
++
++        Check(CouchWindowPolicy.IsGlobeF(keyDown, fn, 3), "globe-f: fn+F toggles");
++        Check(CouchWindowPolicy.IsGlobeF(keyDown, fn | caps, 3), "globe-f: fn+F with caps lock on toggles");
++        Check(!CouchWindowPolicy.IsGlobeF(keyDown, 0, 3), "globe-f: plain F does not");
++        Check(!CouchWindowPolicy.IsGlobeF(keyUp, fn, 3), "globe-f: key up does not");
++        Check(!CouchWindowPolicy.IsGlobeF(keyDown, fn, 4), "globe-f: fn+H does not");
++        Check(!CouchWindowPolicy.IsGlobeF(keyDown, control | command, 3), "globe-f: Ctrl+Cmd+F is left to its key binding");
++        foreach (ulong extra in new[] { shift, control, option, command })
++        {
++            Check(!CouchWindowPolicy.IsGlobeF(keyDown, fn | extra, 3), $"globe-f: fn+F with modifier 0x{extra:x} does not");
++        }
++    }
++
++    static void DrawableSize()
++    {
++        DrawableSizeRequest request = new();
++        Check(!request.TryTake(out _, out _), "drawable: nothing pending at start");
++
++        request.Request(1920, 1080);
++        request.Request(3840, 2160);
++        Check(request.TryTake(out int w, out int h) && w == 3840 && h == 2160, "drawable: the latest request wins");
++        Check(!request.TryTake(out _, out _), "drawable: a request is taken once");
++
++        request.Request(0, 2160);
++        Check(!request.TryTake(out _, out _) && !request.TryTake(out _, out _), "drawable: a zero side is dropped, not left pending");
++        request.Request(int.MaxValue, int.MaxValue);
++        Check(request.TryTake(out w, out h) && w == int.MaxValue && h == int.MaxValue, "drawable: full int range round-trips");
++        request.Request(1, 1);
++        Check(request.TryTake(out w, out h) && w == 1 && h == 1, "drawable: smallest size round-trips");
++
++        // A UI thread resizing while the render thread presents: every taken pair must be one request.
++        (int taken, int torn, bool ordered, int last) = Race(request.Request, (out int tw, out int th) => request.TryTake(out tw, out th));
++        Check(taken > 1_000, $"drawable: the render thread raced the UI thread ({taken} takes)");
++        Check(torn == 0, $"drawable: no torn width/height pair under a concurrent writer ({torn} torn of {taken})");
++        Check(ordered, "drawable: requests are taken in order, none twice");
++        Check(last == RaceRequests, "drawable: the last request is never lost");
++
++        // For comparison only (not a check): the two plain int fields the Metal window used before.
++        LegacyHandoff legacy = new();
++        (int legacyTaken, int legacyTorn, _, int legacyLast) = Race(legacy.Set, legacy.Take);
++        Console.WriteLine($"INFO drawable: old two-field handoff took {legacyTaken}, torn {legacyTorn}, last width {legacyLast} of {RaceRequests}");
++    }
++
++    const int RaceRequests = 500_000;
++
++    delegate bool TakeSize(out int width, out int height);
++
++    static int Expected(int width) => width * 3 + 1;
++
++    static (int Taken, int Torn, bool Ordered, int Last) Race(Action<int, int> request, TakeSize take)
++    {
++        // Warm both paths so neither thread starts late on a JIT compile.
++        request(1, Expected(1));
++        take(out _, out _);
++
++        int taken = 0, torn = 0, last = 0;
++        bool ordered = true;
++        using Barrier start = new(2);
++        using ManualResetEventSlim done = new(false);
++        Thread writer = new(() =>
++        {
++            start.SignalAndWait();
++            for (int i = 1; i <= RaceRequests; i++)
++            {
++                request(i, Expected(i));
++                Thread.SpinWait(20);
++            }
++            done.Set();
++        });
++        writer.Start();
++        start.SignalAndWait();
++        while (true)
++        {
++            bool finished = done.IsSet;
++            while (take(out int w, out int h))
++            {
++                taken++;
++                if (h != Expected(w)) torn++;
++                if (w <= last) ordered = false;
++                last = w;
++            }
++            if (finished) break;
++        }
++        writer.Join();
++        return (taken, torn, ordered, last);
++    }
++
++    sealed class LegacyHandoff
++    {
++        int _width, _height;
++
++        public void Set(int width, int height)
++        {
++            _width = width;
++            _height = height;
++        }
++
++        public bool Take(out int width, out int height)
++        {
++            width = height = 0;
++            if (_width == 0 || _height == 0) return false;
++            width = _width;
++            height = _height;
++            _width = 0;
++            _height = 0;
++            return true;
++        }
++    }
++
++    static int Main()
++    {
++        AvaloniaBinding();
++        ChromeTable();
++        Toggle();
++        EscapeTable();
++        Hotkeys();
++        GlobeF();
++        DrawableSize();
++
++        Console.WriteLine($"RESULT checks={_checks} failures={_failures}");
++        return _failures == 0 ? 0 : 1;
++    }
++}
+diff --git a/source-r16/tests/couch-window/build-and-run.sh b/tests/couch-window/build-and-run.sh
+new file mode 100755
+index 0000000..4715d0f
+--- /dev/null
++++ b/tests/couch-window/build-and-run.sh
+@@ -0,0 +1,24 @@
++#!/bin/bash
++# Offline build + run of the couch-window harness with the pinned SDK and the .53 package closure (same settings as
++# compile-check.sh), at low priority. CPU only: nothing is launched, rendered or installed.
++# Refuses while the user's launcher or game is running.
++# Usage: build-and-run.sh <run-label>
++set -uo pipefail
++HERE="$(cd "$(dirname "$0")" && pwd)"
++K="$(cd "$HERE/../../../.." && pwd)"
++SDK="/Users/eatkinson234/Desktop/Smash Couch/work/controller-launcher/dotnet"
++PREP="$K/shutdown-cancellation-implementation-r1/full-app-build-r1/preparation"
++LABEL="$1"
++pgrep -f 'Smash Couch Smooth.app/Contents/MacOS/SmashCouchNativeMetal' >/dev/null && { echo "user launcher open; not building"; exit 3; }
++pgrep -f 'Smash Couch/Runtime/.*/MacOS/Ryujinx' >/dev/null && { echo "user game running; not building"; exit 3; }
++mkdir -p "$HERE/runs" /private/tmp/smash-couch-window-tmp
++export HOME="$HOME" LANG=en_US.UTF-8 TMPDIR=/private/tmp/smash-couch-window-tmp PATH="$SDK:/usr/bin:/bin:/usr/sbin:/sbin" \
++  DOTNET_ROOT="$SDK" DOTNET_CLI_HOME="$HERE/obj/dotnet-home" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_CLI_USE_MSBUILD_SERVER=0 \
++  DOTNET_NOLOGO=1 MSBUILDDISABLENODEREUSE=1 NUGET_PACKAGES="$PREP/nuget-packages" UseSharedCompilation=false
++nice -n 15 "$SDK/dotnet" build "$HERE/CouchWindowTests.csproj" -c Release -r osx-arm64 --disable-build-servers \
++  -p:RestoreConfigFile="$PREP/nuget.offline.config" -p:UseSharedCompilation=false -p:NodeReuse=false \
++  > "$HERE/runs/$LABEL-build.log" 2>&1 || { echo "build failed"; grep -E ': error ' "$HERE/runs/$LABEL-build.log" | sort -u | head -30; tail -5 "$HERE/runs/$LABEL-build.log"; exit 1; }
++nice -n 15 "$SDK/dotnet" "$HERE/bin/Release/net9.0/osx-arm64/CouchWindowTests.dll" > "$HERE/runs/$LABEL-run.log" 2>&1
++rc=$?
++grep -E "^(FAIL|RESULT)" "$HERE/runs/$LABEL-run.log" | head -60
++echo "exit $rc"; exit $rc

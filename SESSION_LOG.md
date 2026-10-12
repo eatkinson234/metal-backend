@@ -535,3 +535,13 @@
 - 更新缓存、反馈绘制、输入队列、内存、退出和宿主访问崩溃修复的状态及限制；58.3/r16 明确为尚未安装。
 - 无游戏运行、无本机安装修改；不上传游戏、固件、密钥、存档、游戏派生缓存或签名应用。
 - 证据：`smash-couch/releases/58.2.0/BUILD-IDENTITY.json`、`emulator/SOURCE-MANIFEST.json`、`PUBLICATION-CHECKS.json`。
+
+
+### 2026-10-12 | 最新版本复核与 GitHub 刷新
+
+- 用户要求确认“最新”；发现上次上传后本机在 05:47 MDT 已安装 58.3.0/r16，因此刷新公开入口。
+- 核对启动器、模拟器可执行文件与运行清单 SHA-256，确认 legacy pacing marker；冻结源提交，不影响其他工作。
+- 新增 58.3.0 完整身份、27 文件覆盖层、补丁与构建/回滚说明；5,197 源文件重建一致。
+- 另公开 r19 两文件实验增量，完整树身份已验证，明确未安装/A-B 待结果；没有新运行、安装、配置变化。
+- 保留原机 127 软件检查与公开夹具门禁限制的区别；不再次尝试削弱门禁或重复失败检查。
+- 证据：`smash-couch/releases/58.3.0/BUILD-IDENTITY.json`、`PUBLICATION-CHECKS.json`、`emulator/SOURCE-MANIFEST.json`、`smash-couch/experiments/r19/SOURCE-IDENTITY.json`。

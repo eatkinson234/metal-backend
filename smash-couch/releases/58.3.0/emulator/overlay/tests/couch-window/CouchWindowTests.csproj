@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Offline console harness for the r16-ui full-screen and couch-safety rules: the pure policy and the Metal
+       drawable-size handoff (linked from src, unchanged), plus Avalonia 11.0.13's own binding behaviour for
+       Window.WindowStateProperty, which the two-way full-screen sync relies on. Build with build-and-run.sh. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>CouchWindowTests</AssemblyName>
+    <RuntimeIdentifier>osx-arm64</RuntimeIdentifier>
+    <ImplicitUsings>disable</ImplicitUsings><Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Version from Directory.Packages.props (the one the app ships). -->
+    <PackageReference Include="Avalonia" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../../src/Ryujinx/UI/Helpers/CouchWindowPolicy.cs" Link="Linked/CouchWindowPolicy.cs" />
+    <Compile Include="../../src/Ryujinx/Common/KeyboardHotkeyState.cs" Link="Linked/KeyboardHotkeyState.cs" />
+    <Compile Include="../../src/Ryujinx.Graphics.Metal/DrawableSizeRequest.cs" Link="Linked/DrawableSizeRequest.cs" />
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,26 @@
+{
+  "source_reconstruction": true,
+  "source_files": 5197,
+  "source_tree_sha256": "7075f4ba367950102421c9025763810bb7d53b6890a0d4651a8b59eb2450bcd2",
+  "installed_launcher_hash_match": true,
+  "installed_emulator_hash_match": true,
+  "runtime_manifest_hash_match": true,
+  "production_launcher_sources_byte_exact": true,
+  "candidate_r19_patch_reconstruction": true,
+  "candidate_r19_installed": false,
+  "new_gameplay_test": false,
+  "public_fixture_suite_passed": false,
+  "public_fixture_suite_rerun": false,
+  "reason": "Known unchanged private-seed gate blocks sanitized synthetic fixture; do not bypass.127-check local install receipt is separate evidence.",
+  "excludes": [
+    "game files",
+    "keys",
+    "firmware",
+    "saves",
+    "game-derived caches",
+    "signed app bundles",
+    "raw private receipts",
+    "generated test artifacts"
+  ],
+  "source_harness_path_exception": "The original tests/couch-window/build-and-run.sh contains its machine-bound SDK locator. Preserved for byte-exact source identity; not a portable path. No game, key, save or personal document path is included."
+}

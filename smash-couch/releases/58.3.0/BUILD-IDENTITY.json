@@ -1,0 +1,21 @@
+{
+  "launcher_version": "58.3.0",
+  "launcher_executable_sha256": "b66832d7469675cf3dfd7ad4b769ce359e7f1703ac0c4d6c493406239c508248",
+  "launcher_source_commit": "3019700648524392780b0e748024242b1ad6f4b3",
+  "emulator_version": "1.3.3-metal.58-correctness-r16",
+  "emulator_source_commit": "3377b63d5190ddec98a7ac9ff4aacc9835acc899",
+  "emulator_packaged_executable": {
+    "bytes": 73560592,
+    "sha256": "5c8f671654ac03cd0d4cca60295bdb0c4332e5a7d708c0ce3320ed4a207f2762"
+  },
+  "emulator_published_executable": {
+    "bytes": 73559248,
+    "sha256": "dce8432efdf14635a886fa3a106268874ef26196ed697d647c69d588dcb7a86e"
+  },
+  "runtime_manifest_sha256": "cc2ededa8db860f23078ce71d0049aa699dbab3ad124385d02e648e411c535e9",
+  "installed_utc": "2026-10-12T11:47:03Z",
+  "pacing_mode": "legacy; privateData/pacing-legacy marker exists and earlier prewarm logs confirm selection",
+  "source_tree_sha256": "7075f4ba367950102421c9025763810bb7d53b6890a0d4651a8b59eb2450bcd2",
+  "checked_utc": "2026-10-12T16:59:29.492755+00:00",
+  "historical_user_feedback": "User super-smooth report preceded discovery of58.3 install; not transferred as58.3 physical acceptance."
+}

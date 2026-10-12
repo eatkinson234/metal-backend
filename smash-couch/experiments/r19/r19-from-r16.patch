@@ -1,0 +1,292 @@
+diff --git a/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs b/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs
+index 8787864..fe2beb7 100644
+--- a/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs
++++ b/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs
+@@ -40,9 +40,33 @@ namespace Ryujinx.Graphics.Metal
+     // transition). Near-refresh frames shown late despite a normal margin raise it one step when two of
+     // them force a hold or three come within LateWindow; so do TightFramesForRaise frames in a row on
+     // the later refresh with too little spare to shed (a commit steadily later than the lead allows).
+-    // Self-check: presented times off the grid, frames shown earlier than chosen, and near-refresh
+-    // frames shown late at the maximum lead are anomalies; three within 5 s disable the grid for 30 s
+-    // (for the session after the third time), which also leaves the composer free-running.
++    // A shed to the near refresh that ends in a hold with late frames within NearFailWithin is a failed retry of
++    // it (a hold from late commits alone proves nothing; a shed that holds for NearFailWithin clears the count).
++    // After NearFailuresToGiveUp failed retries, or one that started at the longest lead, the near refresh does
++    // not fit (rig A/B pace1 on the Dell at 4K: GPU work 5-13 ms after commit against a 4.3-7.5 ms near margin):
++    // the policy settles on the later refresh at the longest lead for NearRetryAfter (or until the display epoch
++    // changes) instead of retrying every ~32 s, since each failed retry shows one uneven interval. Settled, every
++    // choice keeps at least the lead plus half a refresh: the composer lock only knows "the lead before a
++    // refresh", so a smaller margin would let it pull commits onto the near refresh.
++    //  - entries and re-anchors take the first refresh beyond that floor, and so does the frame after a skipped
++    //    tick (the chain is broken; at 60 Hz its margin would land on the near refresh);
++    //  - margins under the floor (less FarDriftAllowance) count as short, so a drift toward the near refresh or
++    //    late near frames hold, to the first refresh beyond the floor;
++    //  - a choice a whole refresh beyond the floor sheds at once (no clean run needed: the floor is safe by
++    //    construction), so a re-anchor that the lock pulls two refreshes out comes back within a frame or two
++    //    (at 60 Hz that drops one frame instead of staying a frame late for up to 32 s); other sheds stop at the
++    //    floor too.
++    // Near frames shown late at the longest lead are the same evidence whatever put them there (a shed, or a
++    // re-anchor or entry after a stall without catch-up): three within LateWindow settle on the later refresh too.
++    // Settled, near frames shown late only count toward holds.
++    // A frame shown after the LATER refresh it was chosen for (GPU work plus latch beyond lead + one refresh; rig A/B
++    // pace3 on the Dell: 0-17 such frames a minute at 15.6 ms, varying by launch) is stronger evidence still: three
++    // within LateWindow settle at once, and settled they lengthen the lead (LeadStep, up to MaximumSettledLead), so each
++    // launch finds the room its frames need. The settled lead is kept for the display epoch; a 10-minute retry of the
++    // near refresh starts from MaximumLockLead (a longer lead is not a near margin).
++    // Self-check: presented times off the grid and frames shown earlier than chosen are anomalies; three
++    // within 5 s disable the grid for 30 s (for the session after the third time), which also leaves the
++    // composer free-running.
+     internal sealed class PresentRefreshGrid
+     {
+         public const double FramePeriod = 1.0 / 60.0;
+@@ -54,12 +78,17 @@ namespace Ryujinx.Graphics.Metal
+         public const int ShedAfterFrames = 32;
+         public const double LeadStep = 0.0005;
+         public const double MaximumLockLead = 0.0075;
++        public const double MaximumSettledLead = 0.010;
+         public const int TightFramesForRaise = 90;
+         private const int MaximumShedAfterFrames = 1920;
+         private const double BackoffWithin = 30.0;
+         private const double BackoffReset = 60.0;
+         private const double LateWindow = 10.0;
+         private const double LeadSettle = 0.5;
++        private const double NearFailWithin = 1.0;
++        private const int NearFailuresToGiveUp = 3;
++        private const double NearRetryAfter = 600.0;
++        private const double FarDriftAllowance = 0.0005;
+         private const int ConsistentNeeded = 3;
+         private const int History = 64;
+         private const double MarginBinWidth = 0.00025;
+@@ -89,10 +118,15 @@ namespace Ryujinx.Graphics.Metal
+         private int _cleanFrames, _shortMargins, _lateMargins, _pendingLates, _tightFrames, _shedAfter = ShedAfterFrames;
+         private long _window;
+         private double _lastShed = double.NegativeInfinity, _lastDisturbance = double.NegativeInfinity;
++        private double _nearRetryAt = double.NegativeInfinity;
++        private int _nearFailures;
++        private bool _shedPending, _justSettled;
+ 
+         private double _lockLead = PresentationPhaseAlignment.DisplayLockLeadSeconds;
+         private double _lastRaise = double.NegativeInfinity;
+         private readonly double[] _lateEvidence = { double.NegativeInfinity, double.NegativeInfinity };
++        private readonly double[] _farEvidence = { double.NegativeInfinity, double.NegativeInfinity };
++        private double _settledLead = MaximumLockLead;
+ 
+         private readonly int[] _marginBins = new int[160];
+         private int _marginCount;
+@@ -100,7 +134,7 @@ namespace Ryujinx.Graphics.Metal
+         private double _disabledUntil;
+         private int _anomalyCount;
+ 
+-        public long Frames, Entries, Holds, Reanchors, Sheds, BurstSheds, LeadRaises;
++        public long Frames, Entries, Holds, Reanchors, Sheds, BurstSheds, SettledSheds, LeadRaises, SettledLeadRaises, NearGiveUps;
+         public long OnTarget, Late, Early, OffGrid, Skipped, Invalid, Disables;
+ 
+         public double Period => _period;
+@@ -151,7 +185,11 @@ namespace Ryujinx.Graphics.Metal
+             // A new screen or presentation path (full screen vs composited) has its own latch: re-learn.
+             _lockLead = PresentationPhaseAlignment.DisplayLockLeadSeconds;
+             _lastRaise = double.NegativeInfinity;
++            _nearRetryAt = double.NegativeInfinity;
++            _nearFailures = 0;
++            _settledLead = MaximumLockLead;
+             Array.Fill(_lateEvidence, double.NegativeInfinity);
++            Array.Fill(_farEvidence, double.NegativeInfinity);
+             ResetDecisions();
+         }
+ 
+@@ -165,6 +203,7 @@ namespace Ryujinx.Graphics.Metal
+         public void ResetDecisions()
+         {
+             _lastRefresh = 0;
++            _shedPending = false;
+             ResetWindow();
+         }
+ 
+@@ -254,27 +293,64 @@ namespace Ryujinx.Graphics.Metal
+         // A frame shown after the near refresh it was chosen for although its commit margin was normal: GPU
+         // completion plus the compositor latch outran the lock lead. (A short margin already explains a late
+         // frame and counted when it was chosen; a lead cannot help a frame late for the far refresh.) Within
+-        // the current decision window it counts like a short margin; three within LateWindow raise the lead.
+-        // Ignored for the lead for LeadSettle after a raise (frames committed before the composer moved).
++        // the current decision window it counts like a short margin; three within LateWindow raise the lead, or at
++        // the longest lead settle on the later refresh. Ignored for the lead for LeadSettle after a raise (frames
++        // committed before the composer moved).
+         private void OnLate(long window, double margin, double now)
+         {
+-            if (margin < HoldMargin || margin >= _period) return;
+-            if (window == _window) _pendingLates++;
+-            if (now - _lastRaise < LeadSettle) return;
+-            if (_lockLead >= MaximumLockLead - 1e-9)
+-            {
+-                // The longest lead does not fit either: the display does not behave as modelled.
+-                Anomaly(now);
+-            }
+-            else if (now - Math.Min(_lateEvidence[0], _lateEvidence[1]) <= LateWindow)
++            if (margin < HoldMargin) return;
++            if (margin >= _period)
+             {
+-                RaiseLead(now);
++                // Late for the later refresh: the near one cannot fit, and settled the lead is too short.
++                if (now - _lastRaise < LeadSettle) return;
++                if (now - Math.Min(_farEvidence[0], _farEvidence[1]) > LateWindow)
++                {
++                    int oldest = _farEvidence[0] <= _farEvidence[1] ? 0 : 1;
++                    _farEvidence[oldest] = now;
++                }
++                else if (now >= _nearRetryAt) Settle(now);
++                else RaiseSettledLead(now);
++                return;
+             }
+-            else
++            if (window == _window) _pendingLates++;
++            // Settled on the later refresh, the lead is already the longest (frames chosen before the give-up are in
++            // an older window and change nothing).
++            if (now < _nearRetryAt || now - _lastRaise < LeadSettle) return;
++            if (now - Math.Min(_lateEvidence[0], _lateEvidence[1]) > LateWindow)
+             {
+                 int older = _lateEvidence[0] <= _lateEvidence[1] ? 0 : 1;
+                 _lateEvidence[older] = now;
+             }
++            else if (_lockLead >= MaximumLockLead - 1e-9)
++            {
++                // The longest lead does not fit either: the near refresh does not fit on this screen.
++                Settle(now);
++            }
++            else RaiseLead(now);
++        }
++
++        // The near refresh does not fit: stay on the later one at the longest lead until NearRetryAfter.
++        private void Settle(double now)
++        {
++            _nearRetryAt = now + NearRetryAfter;
++            _nearFailures = 0;
++            _shedPending = false;
++            _lockLead = Math.Max(MaximumLockLead, _settledLead);
++            _justSettled = true;
++            _lastRaise = now;
++            Array.Fill(_lateEvidence, double.NegativeInfinity);
++            Array.Fill(_farEvidence, double.NegativeInfinity);
++            NearGiveUps++;
++        }
++
++        private void RaiseSettledLead(double now)
++        {
++            if (_settledLead >= MaximumSettledLead - 1e-9) return;
++            _settledLead = Math.Min(Math.Max(_settledLead, _lockLead) + LeadStep, MaximumSettledLead);
++            _lockLead = _settledLead;
++            _lastRaise = now;
++            Array.Fill(_farEvidence, double.NegativeInfinity);
++            SettledLeadRaises++;
+         }
+ 
+         private void RaiseLead(double now)
+@@ -316,7 +392,23 @@ namespace Ryujinx.Graphics.Metal
+ 
+             double period = _period;
+             double frame = period * _refreshesPerFrame;
+-            double earliest = FirstRefreshAtOrAfter(now + HoldMargin);
++            bool settled = now < _nearRetryAt;
++            if (!settled && _lockLead > MaximumLockLead + 1e-9)
++            {
++                // The 10-minute retry of the near refresh: back to the longest near lead.
++                _lockLead = MaximumLockLead;
++                _lastRaise = now;
++            }
++            // Settled on the later refresh: the composer lock puts commits the lead before a refresh, so a choice
++            // at least half a refresh beyond that keeps it on the later one (see the class comment).
++            double floor = settled ? Math.Max(HoldMargin, _lockLead + period / 2) : HoldMargin;
++            double earliest = FirstRefreshAtOrAfter(now + floor);
++            if (_shedPending && now - _lastShed >= NearFailWithin)
++            {
++                // The near refresh held after the shed: earlier failed retries were coincidences.
++                _shedPending = false;
++                _nearFailures = 0;
++            }
+             if (_lastRefresh > 0)
+             {
+                 // Re-express the previous choice on the current anchor; a jump means a different grid.
+@@ -345,7 +437,7 @@ namespace Ryujinx.Graphics.Metal
+                 double margin = choice - now;
+                 bool late = _pendingLates > 0;
+                 _pendingLates = 0;
+-                if (margin < -period / 2)
++                if (margin < -period / 2 || (settled && now - _lastChoose > frame * 1.5))
+                 {
+                     choice = earliest;
+                     Reanchors++;
+@@ -353,20 +445,37 @@ namespace Ryujinx.Graphics.Metal
+                 }
+                 else
+                 {
+-                    _shortMargins = ((_shortMargins << 1) | (margin < HoldMargin || late ? 1 : 0)) & 0xF;
++                    double shortBelow = settled ? floor - FarDriftAllowance : HoldMargin;
++                    _shortMargins = ((_shortMargins << 1) | (margin < shortBelow || late ? 1 : 0)) & 0xF;
+                     _lateMargins = ((_lateMargins << 1) | (late ? 1 : 0)) & 0xF;
+-                    if (margin < MissMargin || BitOperations.PopCount((uint)_shortMargins) >= 2)
++                    // Settled, a near choice holds at once right after settling or with a late frame pending (the
++                    // settle came from late frames).
++                    if (margin < MissMargin || BitOperations.PopCount((uint)_shortMargins) >= 2 ||
++                        (settled && (late || _justSettled) && margin < shortBelow))
+                     {
+                         // Late frames had margins of at least HoldMargin, where earliest is this same refresh.
++                        bool atLongestLead = _lockLead >= MaximumLockLead - 1e-9;
+                         choice = Math.Max(earliest, choice + period);
+                         Holds++;
+                         if (BitOperations.PopCount((uint)_lateMargins) >= 2) RaiseLead(now);
+                         if (now - _lastShed < BackoffWithin) _shedAfter = Math.Min(_shedAfter * 4, MaximumShedAfterFrames);
++                        if (_shedPending && now - _lastShed < NearFailWithin)
++                        {
++                            _shedPending = false;
++                            // The near refresh does not fit on this screen: settle on the later one.
++                            if (_lateMargins != 0 && (++_nearFailures >= NearFailuresToGiveUp || atLongestLead)) Settle(now);
++                        }
+                         _lastDisturbance = now;
+                         ResetWindow();
+                     }
++                    else if (settled && choice - period >= earliest - period / 4)
++                    {
++                        choice -= period;
++                        SettledSheds++;
++                        ResetWindow();
++                    }
+                     else if (margin > frame + ShedMargin && (_refreshesPerFrame > 1 || now - _lastChoose < frame / 2) &&
+-                        choice - period >= earliestShed)
++                        choice - period >= earliestShed && choice - period >= earliest - period / 4)
+                     {
+                         choice -= period;
+                         BurstSheds++;
+@@ -394,17 +503,20 @@ namespace Ryujinx.Graphics.Metal
+                             }
+                         }
+                         else _tightFrames = 0;
+-                        if (_cleanFrames >= _shedAfter && choice - period >= earliestShed)
++                        if (_cleanFrames >= _shedAfter && choice - period >= earliestShed && choice - period >= earliest - period / 4)
+                         {
+                             choice -= period;
+                             Sheds++;
+                             _lastShed = now;
++                            // Settled, a shed only comes back to the later refresh: not a retry of the near one.
++                            _shedPending = !settled;
+                             ResetWindow();
+                         }
+                     }
+                 }
+             }
+ 
++            _justSettled = false;
+             _lastRefresh = choice;
+             _lastChoose = now;
+             _lastMargin = choice - now;
+diff --git a/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs b/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs
+index 6354416..e82cc34 100644
+--- a/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs
++++ b/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs
+@@ -129,7 +129,7 @@ namespace Ryujinx.Graphics.Metal
+             Logger.Info?.PrintMsg(LogClass.Gpu, string.Create(CultureInfo.InvariantCulture,
+                 $"[CouchPacing] mode={(anchored ? "anchored" : "cpu")};refreshHz={(g.Period > 0 ? 1 / g.Period : 0):F4};k={g.RefreshesPerFrame};" +
+                 $"screen={_sample?.ScreenNumber};fullScreen={_sample?.FullScreen};sessionOff={g.DisabledForSession};" +
+-                $"leadMs={g.LockLead * 1000:F1};leadRaises={g.LeadRaises};marginP1Ms={margins.P1 * 1000:F2};marginP50Ms={margins.P50 * 1000:F2};" +
++                $"leadMs={g.LockLead * 1000:F1};leadRaises={g.LeadRaises};nearGiveUps={g.NearGiveUps};marginP1Ms={margins.P1 * 1000:F2};marginP50Ms={margins.P50 * 1000:F2};" +
+                 $"frames={g.Frames};cpuFrames={_cpuFrames};entries={g.Entries};holds={g.Holds};reanchors={g.Reanchors};" +
+                 $"sheds={g.Sheds};burstSheds={g.BurstSheds};shedAfter={g.ShedAfter};onTarget={g.OnTarget};late={g.Late};early={g.Early};" +
+                 $"offGrid={g.OffGrid};skipped={g.Skipped};invalid={g.Invalid};disables={g.Disables};registerErrors={_registerErrors};" +
