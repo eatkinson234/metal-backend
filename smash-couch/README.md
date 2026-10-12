@@ -1,15 +1,12 @@
-# Smash Couch native Metal snapshot
+# Smash Couch 原生 Metal
 
-Source snapshot: October 9, 2026. This contains the current `.53` emulator changes, the capped `53.2.0` launcher candidate, and the light UI preview from the three Smash Couch chats. The existing project under `src/` remains intact; its Ryubing revision differs from the exact build used by this work.
+最新公开版本：**58.2.0 / 原生 Metal .58 r15**，对应 2026-10-11 当前本机正式安装。用户最新反馈：“It is super smooth now which is awesome”。
 
-| Component | Included | Verified scope | Remaining |
-| --- | --- | --- | --- |
-| Native emulator `.53` | [109-file overlay](emulator/overlay), [cumulative patch](emulator/native-metal53.patch), [full source identity](emulator/SOURCE-MANIFEST.json), native bridge source | Source identity; recorded build/signing; Run199 native replay, normal game clock and ordinary close | Normal launcher profile, broader rendering and physical-controller acceptance; installation |
-| Capped launcher `53.2.0` | [Source, tests and build scripts](launcher) | 85 recorded CPU checks; signed local candidate | Full normal-profile replay and real join/launch/reconnect checks; installation |
-| Light UI preview | [Swift source, tests, artwork and build scripts](ui-preview) | 169 recorded software checks and native preview inspection | Live adapter, real controllers, TV and installation |
+- [最新状态与验证边界](STATUS.md)
+- [58.2.0 源码、构建方法与回滚](releases/58.2.0)
+- [安装版本身份与哈希](releases/58.2.0/BUILD-IDENTITY.json)
+- [历史 .53 构建说明](BUILD.md)、[历史 .53 证据](evidence/VERIFICATION-SUMMARY.json)
 
-See [current status](STATUS.md), [source/build instructions](BUILD.md), and [verification summary](evidence/VERIFICATION-SUMMARY.json). The snapshot does not contain a finished release. It includes no game files, firmware, keys, user saves, runtime caches, signed app bundles, or active launch approvals.
+`emulator/`、`launcher/`、`ui-preview/` 保留 10 月 9 日的 .53 快照；最新安装版本位于 `releases/58.2.0/`，不要混用两者。根目录 `src/` 与其历史阶段任务保持原样。
 
-The emulator overlay is byte-exact against the original source identity. Launcher and UI source are copied without implementation changes. Launcher test fixtures replace the original home path with a sample path, documented in [fixture provenance](launcher/FIXTURE-PROVENANCE.json). Historical raw runtime evidence remains local; its identifying hashes are recorded in the verification summary. No new gameplay or GPU test was run to publish this snapshot.
-
-The Ryubing-derived emulator and launcher code retain their included MIT notices. The UI artwork is an original generated asset; its prompt is included. See each component's license file.
+本仓库提供源码，不包含 Nintendo 游戏、密钥、固件、用户存档、运行缓存或签名应用。快照保留原许可声明，路径脱敏范围记录于对应清单。

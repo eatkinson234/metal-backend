@@ -1,0 +1,42 @@
+{
+  "schema": "smash-source-publication-v1",
+  "checked_utc": "2026-10-12T04:54:08.219433+00:00",
+  "source_patch_reconstruction": {
+    "passed": true,
+    "files": 5185,
+    "tree_sha256": "3537807461028f2ae7f79ff99e574c160e33bf6f317d052c01de098f57d5e04d",
+    "method": "Full public .53 manifest match; apply incremental patch; compare all resulting source file hashes with exact r15 archive."
+  },
+  "installed_executable_identity": {
+    "passed": true,
+    "launcher_version": "58.2.0",
+    "native_version": "1.3.3-metal.58-correctness-r15",
+    "hashes": "BUILD-IDENTITY.json"
+  },
+  "launcher_production_source": {
+    "passed": true,
+    "method": "Sources/, build-launcher.sh and run-cpu-checks.sh match source commit 2e441834049deb560a04117668f4bad6882f3c27 byte for byte."
+  },
+  "public_launcher_checks": {
+    "passed": false,
+    "reason": "Redacted fixture seed conflicts with the unchanged production gate private-seed pin. Suite refuses the synthetic session. The test fixture identity digests were updated only to reflect path redaction. No gate bypass or production-source change.",
+    "attempts": 3,
+    "repairs": 2,
+    "earlier_checks": "Initial raw fixture-pin mismatch; then macOS temporary-path alias refused. Final canonical-path run refused private seed/package gate. No further repair attempts.",
+    "original_installed_record": "90 CPU checks recorded at r15 installation; not a fresh public-copy pass."
+  },
+  "new_gameplay_test": false,
+  "local_installation_changed": false,
+  "excluded_payloads": [
+    "games",
+    "keys",
+    "firmware",
+    "saves",
+    "game-derived shader and pipeline caches",
+    "signed apps",
+    "private raw runtime receipts",
+    "generated test artifacts"
+  ],
+  "historical_snapshot_preserved": true,
+  "known_limits": "See ../../STATUS.md"
+}

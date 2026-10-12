@@ -1,0 +1,4284 @@
+diff --git a/src/Ryujinx/AppHost.cs b/src/Ryujinx/AppHost.cs
+index 9deeacb..f5491c8 100644
+--- a/src/Ryujinx/AppHost.cs
++++ b/src/Ryujinx/AppHost.cs
+@@ -112,6 +112,37 @@ namespace Ryujinx.Ava
+         private uint _previousCount = 0;
+ 
+         private bool _isStopped;
++
++        // Program.Main keeps the private self-telemetry heartbeat until every
++        // started game context has been disposed on its own thread. Disposal
++        // ends with the renderer saving shader/pipeline preparation, and after a
++        // long session it can outlast the supervisor's 3 s staleness limit.
++        private static readonly object _contextsGate = new();
++        private static int _activeContexts;
++        private static readonly ManualResetEventSlim _contextsDisposed = new(true);
++        private bool _contextCounted;
++
++        internal static bool WaitForContextDisposal(TimeSpan timeout) => _contextsDisposed.Wait(timeout);
++
++        private void RegisterContext()
++        {
++            lock (_contextsGate)
++            {
++                if (_contextCounted) return;
++                _contextCounted = true;
++                if (++_activeContexts == 1) _contextsDisposed.Reset();
++            }
++        }
++
++        private void ReleaseContext()
++        {
++            lock (_contextsGate)
++            {
++                if (!_contextCounted) return;
++                _contextCounted = false;
++                if (--_activeContexts == 0) _contextsDisposed.Set();
++            }
++        }
+         private bool _isActive;
+         private bool _renderingStarted;
+ 
+@@ -480,7 +511,16 @@ namespace Ryujinx.Ava
+ 
+             _isActive = true;
+ 
+-            _renderingThread.Start();
++            RegisterContext();
++            try
++            {
++                _renderingThread.Start();
++            }
++            catch
++            {
++                ReleaseContext();
++                throw;
++            }
+ 
+             _viewModel.Volume = ConfigurationState.Instance.System.AudioVolume.Value;
+             
+@@ -588,22 +628,29 @@ namespace Ryujinx.Ava
+ 
+         public void DisposeContext()
+         {
+-            Dispose();
++            try
++            {
++                Dispose();
+ 
+-            _isActive = false;
++                _isActive = false;
+ 
+-            // NOTE: The render loop is allowed to stay alive until the renderer itself is disposed, as it may handle resource dispose.
+-            // We only need to wait for all commands submitted during the main gpu loop to be processed.
+-            _gpuDoneEvent.WaitOne();
+-            _gpuDoneEvent.Dispose();
++                // NOTE: The render loop is allowed to stay alive until the renderer itself is disposed, as it may handle resource dispose.
++                // We only need to wait for all commands submitted during the main gpu loop to be processed.
++                _gpuDoneEvent.WaitOne();
++                _gpuDoneEvent.Dispose();
+ 
+-            DisplaySleep.Restore();
++                DisplaySleep.Restore();
+ 
+-            NpadManager.Dispose();
+-            TouchScreenManager.Dispose();
+-            Device.Dispose();
++                NpadManager.Dispose();
++                TouchScreenManager.Dispose();
++                Device.Dispose();
+ 
+-            DisposeGpu();
++                DisposeGpu();
++            }
++            finally
++            {
++                ReleaseContext();
++            }
+ 
+             AppExit?.Invoke(this, EventArgs.Empty);
+         }
+diff --git a/src/Ryujinx/Program.cs b/src/Ryujinx/Program.cs
+index 86d1f4f..27fa848 100644
+--- a/src/Ryujinx/Program.cs
++++ b/src/Ryujinx/Program.cs
+@@ -98,7 +98,18 @@ namespace Ryujinx.Ava
+                 .Register<FontAwesomeIconProvider>()
+                 .Register<MaterialDesignIconProvider>();
+ 
+-            return BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
++            int exitCode = BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
++
++            // The game context is disposed on GUI.WindowThread after the UI lifetime
++            // ends. Keep the telemetry heartbeat (disposed with Main) until that
++            // finishes, so a slow but progressing save is not stopped as stale; the
++            // bound still lets the supervisor stop a hung shutdown.
++            if (!AppHost.WaitForContextDisposal(TimeSpan.FromSeconds(45)))
++            {
++                Console.Error.WriteLine("Game context still disposing after 45 s; ending telemetry.");
++            }
++
++            return exitCode;
+         }
+ 
+         public static AppBuilder BuildAvaloniaApp() =>
+diff --git a/src/Ryujinx.Cpu/AppleHv/HvMemoryManager.cs b/src/Ryujinx.Cpu/AppleHv/HvMemoryManager.cs
+index decb0e4..ba36d95 100644
+--- a/src/Ryujinx.Cpu/AppleHv/HvMemoryManager.cs
++++ b/src/Ryujinx.Cpu/AppleHv/HvMemoryManager.cs
+@@ -148,6 +148,8 @@ namespace Ryujinx.Cpu.AppleHv
+                 {
+                     throw;
+                 }
++
++                ReadMappedPages(va, data);
+             }
+         }
+ 
+@@ -163,6 +165,8 @@ namespace Ryujinx.Cpu.AppleHv
+                 {
+                     throw;
+                 }
++
++                WriteMappedPages(va, data, tracked: true);
+             }
+         }
+ 
+@@ -178,6 +182,79 @@ namespace Ryujinx.Cpu.AppleHv
+                 {
+                     throw;
+                 }
++
++                WriteMappedPages(va, data, tracked: false);
++            }
++        }
++
++        /// <summary>
++        /// Redoes a read the invalid access handler allowed to continue, one page at a time: mapped pages are read,
++        /// and pages that are unmapped or outside the address space read as zeros. The first attempt stopped at the
++        /// first such page, which would leave any mapped pages after it unread.
++        /// </summary>
++        private void ReadMappedPages(ulong va, Span<byte> data)
++        {
++            int offset = 0;
++
++            while (offset < data.Length)
++            {
++                ulong pageVa = va + (ulong)offset;
++                int size = Math.Min(data.Length - offset, PageSize - (int)(pageVa & PageMask));
++                Span<byte> page = data.Slice(offset, size);
++
++                if (pageVa < va || !IsMapped(pageVa))
++                {
++                    page.Clear();
++                }
++                else
++                {
++                    try
++                    {
++                        base.Read(pageVa, page);
++                    }
++                    catch (InvalidMemoryRegionException)
++                    {
++                        page.Clear(); // Unmapped since the check.
++                    }
++                }
++
++                offset += size;
++            }
++        }
++
++        /// <summary>
++        /// Redoes a write the invalid access handler allowed to continue, one page at a time: mapped pages are
++        /// written, and data for pages that are unmapped or outside the address space is dropped.
++        /// </summary>
++        private void WriteMappedPages(ulong va, ReadOnlySpan<byte> data, bool tracked)
++        {
++            int offset = 0;
++
++            while (offset < data.Length)
++            {
++                ulong pageVa = va + (ulong)offset;
++                int size = Math.Min(data.Length - offset, PageSize - (int)(pageVa & PageMask));
++
++                if (pageVa >= va && IsMapped(pageVa))
++                {
++                    try
++                    {
++                        if (tracked)
++                        {
++                            base.Write(pageVa, data.Slice(offset, size));
++                        }
++                        else
++                        {
++                            base.WriteUntracked(pageVa, data.Slice(offset, size));
++                        }
++                    }
++                    catch (InvalidMemoryRegionException)
++                    {
++                        // Unmapped since the check; dropped like the other unmapped pages.
++                    }
++                }
++
++                offset += size;
+             }
+         }
+ 
+diff --git a/src/Ryujinx.Cpu/IVirtualMemoryManagerTracked.cs b/src/Ryujinx.Cpu/IVirtualMemoryManagerTracked.cs
+index e8d11ed..0f2a4d7 100644
+--- a/src/Ryujinx.Cpu/IVirtualMemoryManagerTracked.cs
++++ b/src/Ryujinx.Cpu/IVirtualMemoryManagerTracked.cs
+@@ -7,6 +7,11 @@ namespace Ryujinx.Cpu
+ {
+     public interface IVirtualMemoryManagerTracked : IVirtualMemoryManager
+     {
++        /// <summary>
++        /// Memory tracking of this address space.
++        /// </summary>
++        MemoryTracking Tracking { get; }
++
+         /// <summary>
+         /// Reads data from CPU mapped memory, with read tracking
+         /// </summary>
+diff --git a/source58/src/Ryujinx.Graphics.GAL/Multithreading/ProgramWaitObserver.cs b/src/Ryujinx.Graphics.GAL/Multithreading/ProgramWaitObserver.cs
+new file mode 100644
+index 0000000..ac4e9f0
+--- /dev/null
++++ b/src/Ryujinx.Graphics.GAL/Multithreading/ProgramWaitObserver.cs
+@@ -0,0 +1,13 @@
++using System;
++
++namespace Ryujinx.Graphics.GAL.Multithreading
++{
++    /// <summary>
++    /// Diagnostics hook for the render thread's waits on programs that had not finished compiling
++    /// (ProgramQueue.WaitForProgram). Receives Stopwatch timestamps; the backend installs it.
++    /// </summary>
++    public static class ProgramWaitObserver
++    {
++        public static Action<long, long> Observed { get; set; }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.GAL/Multithreading/Resources/ProgramQueue.cs b/src/Ryujinx.Graphics.GAL/Multithreading/Resources/ProgramQueue.cs
+index 902527b..2998717 100644
+--- a/src/Ryujinx.Graphics.GAL/Multithreading/Resources/ProgramQueue.cs
++++ b/src/Ryujinx.Graphics.GAL/Multithreading/Resources/ProgramQueue.cs
+@@ -1,6 +1,7 @@
+ using Ryujinx.Graphics.GAL.Multithreading.Resources.Programs;
+ using System;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Threading;
+ 
+ namespace Ryujinx.Graphics.GAL.Multithreading.Resources
+@@ -91,6 +92,12 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Resources
+         /// <param name="program">The program to wait for</param>
+         public void WaitForProgram(ThreadedProgram program)
+         {
++            if (program.Compiled)
++            {
++                return;
++            }
++
++            long start = Stopwatch.GetTimestamp();
+             Span<SpinWait> spinWait = stackalloc SpinWait[1];
+ 
+             while (!program.Compiled)
+@@ -102,6 +109,8 @@ namespace Ryujinx.Graphics.GAL.Multithreading.Resources
+                     spinWait[0].SpinOnce(-1);
+                 }
+             }
++
++            ProgramWaitObserver.Observed?.Invoke(start, Stopwatch.GetTimestamp());
+         }
+     }
+ }
+diff --git a/src/Ryujinx.Graphics.Gpu/Memory/PhysicalMemory.cs b/src/Ryujinx.Graphics.Gpu/Memory/PhysicalMemory.cs
+index 73b6c07..5a0ca09 100644
+--- a/src/Ryujinx.Graphics.Gpu/Memory/PhysicalMemory.cs
++++ b/src/Ryujinx.Graphics.Gpu/Memory/PhysicalMemory.cs
+@@ -492,9 +492,22 @@ namespace Ryujinx.Graphics.Gpu.Memory
+         /// </summary>
+         private void Destroy()
+         {
+-            ShaderCache.Dispose();
+-            BufferCache.Dispose();
+-            TextureCache.Dispose();
++            // The caches release every tracking handle of this process, in ascending address order. Remove the
++            // emptied regions in one pass at the end rather than one by one (see MemoryTracking.BeginBulkRelease).
++            MemoryTracking tracking = _cpuMemory.Tracking;
++
++            tracking.BeginBulkRelease();
++
++            try
++            {
++                ShaderCache.Dispose();
++                BufferCache.Dispose();
++                TextureCache.Dispose();
++            }
++            finally
++            {
++                tracking.EndBulkRelease();
++            }
+ 
+             DecrementReferenceCount();
+         }
+diff --git a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+index 63a6dbb..830bdf6 100644
+--- a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
++++ b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+@@ -3,6 +3,7 @@ using Ryujinx.Common.Memory;
+ using Ryujinx.Graphics.GAL;
+ using Ryujinx.Graphics.Metal.State;
+ using Ryujinx.Graphics.Shader;
++using SharpMetal.Foundation;
+ using SharpMetal.Metal;
+ using System;
+ using System.Collections.Generic;
+@@ -43,6 +44,13 @@ namespace Ryujinx.Graphics.Metal
+         private bool _snapshotReadonlyStencil148;
+         private string _cubeDiagnosticDrawContext;
+ 
++        // General feedback copies (FeedbackCopy.cs) for the current draw.
++        private static readonly bool _feedbackCopyEnabled =
++            Environment.GetEnvironmentVariable("SMASH_COUCH_FEEDBACK_COPY") != "0";
++        private EncoderState _copyState;
++        private Auto<FeedbackCopyLease> _copyLease;
++        private List<(int Binding, TextureRef Original)> _copyOriginals;
++
+         public readonly IndexBufferState IndexBuffer => _currentState.IndexBuffer;
+         public readonly PrimitiveTopology Topology => _currentState.Topology;
+         public readonly Texture[] RenderTargets => _currentState.RenderTargets;
+@@ -291,8 +299,197 @@ namespace Ryujinx.Graphics.Metal
+                 _currentState?.RenderProgram, _snapshotAdmissionRejection, failure);
+         }
+ 
++        // Runs after the reviewed depth-snapshot path and before argument
++        // buffers are written. Replaces every non-array sampled binding that
++        // aliases a current attachment with a copy of its pre-draw contents.
++        // Anything outside the supported scope is left unchanged, so the guard
++        // still rejects it. Never throws a FeedbackGuardException.
++        public void PrepareFeedbackCopies(string context)
++        {
++            if (!_feedbackCopyEnabled || _copyLease != null) return;
++            EncoderState state = _currentState;
++            Program program = state.RenderProgram;
++            if (program?.BindingSegments == null || state.ClearLoadAction ||
++                program.BindingSegments.Length <= Constants.TexturesSetIndex) return;
++
++            List<(string Role, RenderFeedbackGuard.Identity Id)> attachments = null;
++            for (int i = 0; i < state.RenderTargets.Length; i++)
++            {
++                if (state.RenderTargets[i] is not Texture target) continue;
++                RenderFeedbackGuard.Identity id = RenderFeedbackGuard.ReadIdentity(target.GetRenderAttachmentHandle());
++                if (!id.Known) return;
++                (attachments ??= new(Constants.MaxColorAttachments + 1)).Add(($"color[{i}]", id));
++            }
++            if (state.DepthStencil is Texture depth)
++            {
++                RenderFeedbackGuard.Identity id = RenderFeedbackGuard.ReadIdentity(depth.GetHandle());
++                if (!id.Known) return;
++                (attachments ??= new(1)).Add(($"depth/stencil:{depth.MtlFormat}", id));
++            }
++            if (attachments == null) return;
++
++            List<(int Binding, Texture Source, MTLTexture Handle, RenderFeedbackGuard.Identity Id, string Signature)> aliases = null;
++            foreach (ResourceBindingSegment segment in program.BindingSegments[Constants.TexturesSetIndex])
++            {
++                if ((segment.Stages & (ResourceStages.Vertex | ResourceStages.Fragment)) == 0 || segment.IsArray) continue;
++                for (int i = 0; i < segment.Count; i++)
++                {
++                    int binding = segment.Binding + i;
++                    if (state.TextureRefs[binding].Storage is not Texture source) continue;
++                    MTLTexture handle = source.GetHandle();
++                    RenderFeedbackGuard.Identity id = RenderFeedbackGuard.ReadIdentity(handle);
++                    if (!id.Known) return;
++                    string role = null;
++                    foreach ((string attachmentRole, RenderFeedbackGuard.Identity attachmentId) in attachments)
++                    {
++                        RenderFeedbackGuard.Relation relation = RenderFeedbackGuard.Compare(id, attachmentId);
++                        if (relation == RenderFeedbackGuard.Relation.Unknown) return;
++                        if (relation == RenderFeedbackGuard.Relation.PotentialAlias)
++                        {
++                            role = attachmentRole;
++                            break;
++                        }
++                    }
++                    if (role == null) continue;
++                    string signature = $"stages={segment.Stages};binding={binding};attachment={role};" +
++                        $"view={handle.PixelFormat};root={new MTLTexture(id.Root).PixelFormat};levels={id.Levels};" +
++                        $"rootLevel={id.Level};rootSlice={id.Slice};state={(ReferenceEquals(state, _mainState) ? "Main" : "Helper")}";
++                    if (!FeedbackCopyable(handle, id))
++                    {
++                        // Record why the copy was declined; the guard then
++                        // rejects and counts the draw under its own class.
++                        FeedbackStats.CountStop($"copy-declined=unsupported-view;type={handle.TextureType};" +
++                            $"samples={handle.SampleCount};layers={id.Layers};buffer={id.Buffer != IntPtr.Zero};{signature}");
++                        return;
++                    }
++                    (aliases ??= new(2)).Add((binding, source, handle, id, signature));
++                }
++            }
++            if (aliases == null) return;
++
++            Auto<FeedbackCopyLease> lease = new(new FeedbackCopyLease(_pipeline.FeedbackCopyPool));
++            List<(int Binding, TextureRef Original)> originals = new(aliases.Count);
++            try
++            {
++                lease.Get(_pipeline.Cbs);
++                _pipeline.EndCurrentPass();
++                MTLBlitCommandEncoder blit = _pipeline.GetOrCreateBlitEncoder();
++                Dictionary<(IntPtr Root, ulong Level, ulong Slice, ulong Levels), MTLTexture> copies = new(aliases.Count);
++                foreach ((int binding, Texture source, MTLTexture handle, RenderFeedbackGuard.Identity id, string signature) in aliases)
++                {
++                    var copyKey = (id.Root, id.Level, id.Slice, id.Levels);
++                    if (!copies.TryGetValue(copyKey, out MTLTexture copy))
++                    {
++                        MTLTexture root = new(id.Root);
++                        ulong width = Math.Max(1UL, root.Width >> (int)id.Level);
++                        ulong height = Math.Max(1UL, root.Height >> (int)id.Level);
++                        FeedbackCopyPool.Key key = new(root.PixelFormat, width, height, id.Levels);
++                        copy = _pipeline.FeedbackCopyPool.Rent(key);
++                        lease.GetUnsafe().AddRoot(key, copy);
++                        for (ulong level = 0; level < id.Levels; level++)
++                        {
++                            blit.CopyFromTexture(root, id.Slice, id.Level + level, new MTLOrigin(),
++                                new MTLSize
++                                {
++                                    width = Math.Max(1UL, width >> (int)level),
++                                    height = Math.Max(1UL, height >> (int)level),
++                                    depth = 1,
++                                },
++                                copy, 0, level, new MTLOrigin());
++                        }
++                        copies[copyKey] = copy;
++                    }
++
++                    MTLTexture view = copy.NewTextureView(handle.PixelFormat, MTLTextureType.Type2D,
++                        new NSRange { location = 0, length = id.Levels },
++                        new NSRange { location = 0, length = 1 },
++                        handle.Swizzle);
++                    if (view.NativePtr == IntPtr.Zero)
++                    {
++                        throw new InvalidOperationException("Feedback copy view creation failed.");
++                    }
++                    FeedbackCopyTexture copyTexture = _pipeline.CreateFeedbackCopyTexture(source.Info, view, handle.PixelFormat);
++                    lease.GetUnsafe().AddView(copyTexture);
++
++                    TextureRef original = state.TextureRefs[binding];
++                    originals.Add((binding, original));
++                    state.TextureRefs[binding] = original with { Storage = copyTexture };
++                }
++                _pipeline.EndCurrentPass();
++            }
++            catch (Exception failure)
++            {
++                foreach ((int binding, TextureRef original) in originals)
++                {
++                    state.TextureRefs[binding] = original;
++                }
++                state.Dirty |= DirtyFlags.Textures;
++                lease.Dispose(); // Encoded copies keep their command-buffer dependency.
++                FeedbackStats.CountStop($"copy-failed={failure.GetType().Name}:{failure.Message}");
++                Logger.Error?.Print(LogClass.Gpu, $"[CouchNativeFeedback] copy failed at {context}; " +
++                    $"{string.Join(" | ", aliases.Select(alias => alias.Signature))}: {failure}");
++                return; // The guard rejects the unchanged draw.
++            }
++
++            foreach (var alias in aliases)
++            {
++                FeedbackStats.CountCopy(alias.Signature);
++            }
++
++            // The pass ended; every state category needs a new encoder bind.
++            SignalRenderDirty();
++            _copyState = state;
++            _copyLease = lease;
++            _copyOriginals = originals;
++        }
++
++        // Single-sample 2D view of one slice of a device texture; root kinds
++        // whose slices are addressable by a plain copy.
++        private static bool FeedbackCopyable(MTLTexture handle, RenderFeedbackGuard.Identity id)
++        {
++            if (id.Buffer != IntPtr.Zero || id.Layers != 1 || id.Levels < 1 ||
++                handle.SampleCount != 1 || handle.TextureType != MTLTextureType.Type2D) return false;
++            MTLTexture root = new(id.Root);
++            if (root.SampleCount != 1 || id.Level + id.Levels > root.MipmapLevelCount) return false;
++            ulong slices = root.TextureType switch
++            {
++                MTLTextureType.Type2D => 1,
++                MTLTextureType.Type2DArray => root.ArrayLength,
++                MTLTextureType.Cube => 6,
++                MTLTextureType.CubeArray => 6 * root.ArrayLength,
++                _ => 0,
++            };
++            return id.Slice < slices;
++        }
++
++        private void FinishFeedbackCopies()
++        {
++            Auto<FeedbackCopyLease> lease = _copyLease;
++            if (lease == null) return;
++            try
++            {
++                foreach ((int binding, TextureRef original) in _copyOriginals)
++                {
++                    _copyState.TextureRefs[binding] = original;
++                }
++                _copyState.Dirty |= DirtyFlags.Textures;
++            }
++            finally
++            {
++                _copyState = null;
++                _copyLease = null;
++                _copyOriginals = null;
++                // Copies return to the pool only when this command buffer
++                // completes; count them like disposed buffers so a frame with
++                // many feedback draws is submitted before memory piles up.
++                _pipeline.FlushCommandsIfWeightExceeding(lease, lease.GetUnsafe().Bytes);
++                lease.Dispose(); // Command-buffer dependency persists until fence.
++            }
++        }
++
+         public void FinishFeedbackDraw()
+         {
++            FinishFeedbackCopies();
+             Auto<DepthFeedbackSnapshot> lease = _snapshotLease;
+             if (lease == null) return;
+ 
+@@ -635,6 +832,7 @@ namespace Ryujinx.Graphics.Metal
+ 
+         private readonly void SetRenderPipelineState(MTLRenderCommandEncoder renderCommandEncoder)
+         {
++            _currentState.RenderProgram?.ObservePipelineRequest(ref _currentState.Pipeline.Internal);
+             MTLRenderPipelineState pipelineState = _currentState.Pipeline.CreateRenderPipeline(_device, _currentState.RenderProgram);
+ 
+             renderCommandEncoder.SetRenderPipelineState(pipelineState);
+@@ -727,6 +925,7 @@ namespace Ryujinx.Graphics.Metal
+         public readonly void UpdateProgram(IProgram program)
+         {
+             Program prg = (Program)program;
++            prg.EnsureCompiled();
+ 
+             if (prg.VertexFunction == IntPtr.Zero && prg.ComputeFunction == IntPtr.Zero)
+             {
+@@ -1391,7 +1590,12 @@ namespace Ryujinx.Graphics.Metal
+ 
+         private readonly void UpdatePipelineVertexState(VertexBufferState[] bufferDescriptors, VertexAttribDescriptor[] attribDescriptors)
+         {
+-            ref PipelineState pipeline = ref _currentState.Pipeline;
++            ApplyVertexState(ref _currentState.Pipeline, bufferDescriptors, attribDescriptors);
++        }
++
++        // Shared with SpeculativePipelines so a predicted key is built by the same code.
++        internal static void ApplyVertexState(ref PipelineState pipeline, VertexBufferState[] bufferDescriptors, VertexAttribDescriptor[] attribDescriptors)
++        {
+             uint indexMask = 0;
+ 
+             for (int i = 0; i < attribDescriptors.Length; i++)
+@@ -1625,8 +1829,10 @@ namespace Ryujinx.Graphics.Metal
+ 
+             int vertResourceIdIndex = 0;
+             int fragResourceIdIndex = 0;
++            // The identity is only set when the diagnostics were on at program creation; testing it first keeps
++            // this per-draw path from reading the environment.
+             bool captureCubeBindings = setIndex == Constants.TexturesSetIndex &&
+-                CubeBindingDiagnostics.Enabled && program.CubeDiagnosticIdentity != null;
++                program.CubeDiagnosticIdentity != null && CubeBindingDiagnostics.Enabled;
+             List<Dictionary<string, object>> cubeBindingRecords = captureCubeBindings ? [] : null;
+             List<Dictionary<string, object>> cubeEmittedSlots = captureCubeBindings ? [] : null;
+             int expectedFragmentSlotOffset = 0;
+diff --git a/source58/src/Ryujinx.Graphics.Metal/FeedbackCopy.cs b/src/Ryujinx.Graphics.Metal/FeedbackCopy.cs
+new file mode 100644
+index 0000000..d6b00e7
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/FeedbackCopy.cs
+@@ -0,0 +1,254 @@
++using Ryujinx.Common.Logging;
++using Ryujinx.Graphics.GAL;
++using SharpMetal.Foundation;
++using SharpMetal.Metal;
++using System;
++using System.Collections.Generic;
++using System.Runtime.Versioning;
++using System.Text.RegularExpressions;
++using System.Threading;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // A guest draw that samples a texture which is also bound as one of its
++    // render targets is a feedback loop. Guest GPUs define the sampled result
++    // only for data written before the draw (texture-barrier rule: a draw does
++    // not reliably observe its own writes, except a fragment re-reading the old
++    // value of the texel it is about to write). Ending the Metal pass stores
++    // every earlier write; a copy of the sampled subresource taken then holds
++    // exactly the data every defined guest result may depend on. Binding the
++    // copy instead of the live attachment therefore preserves the guest result
++    // and removes the Metal attachment/sample hazard the guard rejects.
++    //
++    // Scope: non-array sampled textures (set 2) whose view is a single-sample
++    // 2D view of one slice. Images (possibly written), texture arrays, buffer
++    // textures and unknown identities are left to RenderFeedbackGuard.
++    [SupportedOSPlatform("macos")]
++    sealed class FeedbackCopyTexture : TextureBase
++    {
++        internal FeedbackCopyTexture(MTLDevice device, MetalRenderer renderer, Pipeline pipeline,
++            TextureCreateInfo info, MTLTexture view, MTLPixelFormat format) : base(device, renderer, pipeline, info)
++        {
++            MtlTexture = view;
++            MtlFormat = format;
++        }
++    }
++
++    [SupportedOSPlatform("macos")]
++    sealed class FeedbackCopyPool : IDisposable
++    {
++        internal readonly record struct Key(MTLPixelFormat Format, ulong Width, ulong Height, ulong Levels);
++
++        private const int MaxFreePerKey = 4;
++        private const MTLStorageMode PrivateStorage = (MTLStorageMode)2;
++
++        private readonly MTLDevice _device;
++        private readonly Dictionary<Key, Stack<MTLTexture>> _free = new();
++        private readonly object _lock = new();
++        private bool _disposed;
++
++        internal FeedbackCopyPool(MTLDevice device)
++        {
++            _device = device;
++        }
++
++        internal MTLTexture Rent(Key key)
++        {
++            lock (_lock)
++            {
++                if (_free.TryGetValue(key, out Stack<MTLTexture> stack) && stack.Count > 0)
++                {
++                    return stack.Pop();
++                }
++            }
++
++            MTLTextureDescriptor descriptor = new()
++            {
++                PixelFormat = key.Format,
++                TextureType = MTLTextureType.Type2D,
++                Width = key.Width,
++                Height = key.Height,
++                MipmapLevelCount = key.Levels,
++                Usage = MTLTextureUsage.Unknown,
++                StorageMode = PrivateStorage,
++            };
++            MTLTexture texture = _device.NewTexture(descriptor);
++            descriptor.Dispose();
++            if (texture.NativePtr == IntPtr.Zero)
++            {
++                throw new InvalidOperationException($"Feedback copy allocation failed for {key}.");
++            }
++            return texture;
++        }
++
++        // Called once the command buffers that used the texture have completed.
++        internal void Return(Key key, MTLTexture texture)
++        {
++            lock (_lock)
++            {
++                if (!_disposed)
++                {
++                    if (!_free.TryGetValue(key, out Stack<MTLTexture> stack))
++                    {
++                        _free[key] = stack = new Stack<MTLTexture>();
++                    }
++                    if (stack.Count < MaxFreePerKey)
++                    {
++                        stack.Push(texture);
++                        return;
++                    }
++                }
++            }
++            texture.Dispose();
++        }
++
++        public void Dispose()
++        {
++            lock (_lock)
++            {
++                _disposed = true;
++                foreach (Stack<MTLTexture> stack in _free.Values)
++                {
++                    while (stack.Count > 0)
++                    {
++                        stack.Pop().Dispose();
++                    }
++                }
++                _free.Clear();
++            }
++        }
++    }
++
++    // Owned through Auto<> so the copies outlive every command buffer that
++    // encoded them; disposal returns the copy roots to the pool.
++    [SupportedOSPlatform("macos")]
++    sealed class FeedbackCopyLease : IDisposable
++    {
++        private readonly FeedbackCopyPool _pool;
++        private readonly List<(FeedbackCopyPool.Key Key, MTLTexture Texture)> _roots = new(2);
++        private readonly List<FeedbackCopyTexture> _views = new(2);
++        private int _disposed;
++
++        internal FeedbackCopyLease(FeedbackCopyPool pool)
++        {
++            _pool = pool;
++        }
++
++        internal void AddRoot(FeedbackCopyPool.Key key, MTLTexture texture)
++        {
++            _roots.Add((key, texture));
++            Bytes += texture.AllocatedSize;
++        }
++
++        // Device memory held by this lease's copies until its command buffers complete.
++        internal ulong Bytes { get; private set; }
++
++        internal void AddView(FeedbackCopyTexture view) => _views.Add(view);
++
++        public void Dispose()
++        {
++            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
++            foreach (FeedbackCopyTexture view in _views)
++            {
++                view.Release();
++            }
++            _views.Clear();
++            foreach ((FeedbackCopyPool.Key key, MTLTexture texture) in _roots)
++            {
++                _pool.Return(key, texture);
++            }
++            _roots.Clear();
++        }
++    }
++
++    // Distinct-signature accounting for feedback copies, guard stops and skipped
++    // draws. Each new signature is logged once when first seen; every count is
++    // logged in a final summary, so a new class is never hidden behind a global
++    // throttle.
++    [SupportedOSPlatform("macos")]
++    static class FeedbackStats
++    {
++        private static readonly Dictionary<string, long> _counts = new();
++        private static readonly object _lock = new();
++        private static long _copies;
++        private static long _skipped;
++
++        internal static long Copies => Interlocked.Read(ref _copies);
++        internal static long Skipped => Interlocked.Read(ref _skipped);
++
++        private static readonly Regex _volatileFields = new(
++            @"(draw|barrier|stop)=[^;]*;?|(View|Root|Buffer|GpuId) = \d+, ",
++            RegexOptions.Compiled | RegexOptions.CultureInvariant);
++
++        internal static string Normalize(string message) => _volatileFields.Replace(message, string.Empty);
++
++        internal static void CountCopy(string signature)
++        {
++            Interlocked.Increment(ref _copies);
++            Count("copy;" + signature);
++        }
++
++        internal static void CountStop(string message) => Count("stop;" + Normalize(message));
++
++        internal static void CountSkip(string message)
++        {
++            Interlocked.Increment(ref _skipped);
++            Count("skip;" + Normalize(message));
++        }
++
++        private static void Count(string signature)
++        {
++            long count;
++            lock (_lock)
++            {
++                _counts.TryGetValue(signature, out count);
++                _counts[signature] = ++count;
++            }
++            Interlocked.Increment(ref _events);
++            if (count == 1)
++            {
++                string message = $"[CouchNativeFeedback] NEW CLASS;{signature}";
++                Logger.Warning?.PrintMsg(LogClass.Gpu, message);
++                Console.Error.WriteLine(message);
++            }
++            else if (!signature.StartsWith("copy;", StringComparison.Ordinal) && (count & (count - 1)) == 0)
++            {
++                // Rejections and failures stay visible as they repeat.
++                string message = $"[CouchNativeFeedback] REPEAT;count={count};{signature}";
++                Logger.Warning?.PrintMsg(LogClass.Gpu, message);
++                Console.Error.WriteLine(message);
++            }
++        }
++
++        private static long _events;
++        private static long _loggedEvents;
++
++        // Periodic summary so counts survive a killed session; quiet when unchanged.
++        internal static void LogSummaryIfChanged(string reason)
++        {
++            long events = Interlocked.Read(ref _events);
++            if (Interlocked.Exchange(ref _loggedEvents, events) != events)
++            {
++                LogSummary(reason);
++            }
++        }
++
++        internal static void LogSummary(string reason)
++        {
++            List<KeyValuePair<string, long>> entries;
++            lock (_lock)
++            {
++                entries = new List<KeyValuePair<string, long>>(_counts);
++            }
++            string header = $"[CouchNativeFeedback] SUMMARY;reason={reason};copies={Copies};skipped={Skipped};classes={entries.Count}";
++            Logger.Info?.PrintMsg(LogClass.Gpu, header);
++            Console.Error.WriteLine(header);
++            foreach (KeyValuePair<string, long> entry in entries)
++            {
++                string line = $"[CouchNativeFeedback] CLASS;count={entry.Value};{entry.Key}";
++                Logger.Info?.PrintMsg(LogClass.Gpu, line);
++                Console.Error.WriteLine(line);
++            }
++        }
++    }
++}
+diff --git a/source58/src/Ryujinx.Graphics.Metal/FrameSnapshot.cs b/src/Ryujinx.Graphics.Metal/FrameSnapshot.cs
+new file mode 100644
+index 0000000..d956103
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/FrameSnapshot.cs
+@@ -0,0 +1,101 @@
++using Ryujinx.Graphics.GAL;
++using System;
++using System.Diagnostics;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using System.Runtime.Versioning;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Overnight diagnostic: on request, write the guest frame being presented so an
++    // unattended runner can verify which screen is showing without screen recording.
++    // Off unless SMASH_COUCH_SNAPSHOT_DIR names an existing directory inside
++    // SMASH_COUCH_PRIVATE_DATA. A request is the file "request" containing a label.
++    [SupportedOSPlatform("macos")]
++    static class FrameSnapshot
++    {
++        private static readonly string _dir = ValidateDirectory();
++        private static int _frames;
++
++        private static string ValidateDirectory()
++        {
++            string dir = Environment.GetEnvironmentVariable("SMASH_COUCH_SNAPSHOT_DIR");
++            string root = Environment.GetEnvironmentVariable("SMASH_COUCH_PRIVATE_DATA");
++            try
++            {
++                if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(root) || !Path.IsPathFullyQualified(dir) || !Directory.Exists(dir))
++                {
++                    return null;
++                }
++
++                // Compare resolved locations so a symlink cannot lead outside the private data root.
++                string real = Path.GetFullPath(new DirectoryInfo(dir).ResolveLinkTarget(true)?.FullName ?? dir);
++                string realRoot = Path.GetFullPath(new DirectoryInfo(root).ResolveLinkTarget(true)?.FullName ?? root);
++                return real == Path.GetFullPath(dir) && real.StartsWith(realRoot.TrimEnd('/') + "/", StringComparison.Ordinal) ? real : null;
++            }
++            catch (Exception)
++            {
++                return null;
++            }
++        }
++
++        public static void TryCapture(Texture texture)
++        {
++            // Checking for a request every 15 frames costs one stat four times a second.
++            if (_dir == null || ++_frames % 15 != 0)
++            {
++                return;
++            }
++
++            string request = Path.Combine(_dir, "request");
++            string label;
++            try
++            {
++                if (!File.Exists(request))
++                {
++                    return;
++                }
++
++                label = File.ReadAllText(request).Trim();
++                File.Delete(request);
++            }
++            catch (Exception)
++            {
++                return;
++            }
++
++            if (label.Length == 0 || label.Length > 64 || !label.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))
++            {
++                label = "snapshot";
++            }
++
++            // A diagnostic must never take down the render thread; failures are recorded instead.
++            try
++            {
++                long started = Stopwatch.GetTimestamp();
++                using PinnedSpan<byte> data = texture.GetData(0, 0);
++                ReadOnlySpan<byte> bytes = data.Get();
++                using (FileStream file = new(Path.Combine(_dir, label + ".raw"), FileMode.CreateNew, FileAccess.Write))
++                {
++                    file.Write(bytes);
++                }
++
++                File.WriteAllText(Path.Combine(_dir, label + ".json"), string.Create(CultureInfo.InvariantCulture,
++                    $"{{\"width\":{texture.Width},\"height\":{texture.Height},\"format\":\"{texture.Info.Format}\"," +
++                    $"\"bytes\":{bytes.Length},\"stopwatch_ticks\":{started},\"capture_ms\":" +
++                    $"{(Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency:F3}}}"));
++            }
++            catch (Exception error)
++            {
++                try
++                {
++                    File.WriteAllText(Path.Combine(_dir, label + ".error"), error.ToString());
++                }
++                catch (Exception)
++                {
++                }
++            }
++        }
++    }
++}
+diff --git a/source58/src/Ryujinx.Graphics.Metal/ManagedMemoryDiagnostics.cs b/src/Ryujinx.Graphics.Metal/ManagedMemoryDiagnostics.cs
+new file mode 100644
+index 0000000..b21686c
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/ManagedMemoryDiagnostics.cs
+@@ -0,0 +1,73 @@
++using Ryujinx.Common.Logging;
++using System;
++using System.Globalization;
++using System.Text;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Managed heap figures for long sessions. The launcher caps the managed
++    // heap (DOTNET_GCHeapHardLimit) separately from the sampled process
++    // footprint, and a managed OutOfMemoryException ends the game, so the
++    // footprint alone cannot show how close a session is to that cap. Logged
++    // with the periodic summaries: what the last GC saw, per generation, plus
++    // the allocator's running totals. Diagnostics only; never throws.
++    static class ManagedMemoryDiagnostics
++    {
++        private const long MiB = 1024 * 1024;
++        private static readonly string[] _generationNames = ["gen0", "gen1", "gen2", "loh", "poh"];
++
++        internal static string Summary()
++        {
++            GCMemoryInfo info = GC.GetGCMemoryInfo(GCKind.Any);
++            StringBuilder text = new("ManagedMemory: ");
++            text.Append("heapMiB=").Append(info.HeapSizeBytes / MiB);
++            text.Append(";fragmentedMiB=").Append(info.FragmentedBytes / MiB);
++            text.Append(";committedMiB=").Append(info.TotalCommittedBytes / MiB);
++            text.Append(";limitMiB=").Append(info.TotalAvailableMemoryBytes / MiB);
++            text.Append(";loadMiB=").Append(info.MemoryLoadBytes / MiB);
++            text.Append(";highLoadMiB=").Append(info.HighMemoryLoadThresholdBytes / MiB);
++            text.Append(";promotedMiB=").Append(info.PromotedBytes / MiB);
++            text.Append(";pinned=").Append(info.PinnedObjectsCount);
++            ReadOnlySpan<GCGenerationInfo> generations = info.GenerationInfo;
++            for (int index = 0; index < generations.Length && index < _generationNames.Length; index++)
++            {
++                text.Append(';').Append(_generationNames[index]).Append("MiB=").Append(generations[index].SizeAfterBytes / MiB);
++            }
++            text.Append(";liveMiB=").Append(GC.GetTotalMemory(false) / MiB);
++            text.Append(";allocatedMiB=").Append(GC.GetTotalAllocatedBytes(false) / MiB);
++            text.Append(";gcs=").Append(GC.CollectionCount(0)).Append('/').Append(GC.CollectionCount(1)).Append('/').Append(GC.CollectionCount(2));
++            text.Append(";lastGc=").Append(info.Index).Append(":gen").Append(info.Generation).Append(info.Compacted ? ":compacted" : ":swept");
++            // Pause time: the running total since start (per-interval deltas come from consecutive lines), the last
++            // collection's pauses, and the last full blocking collection, which is the one that can stall a frame.
++            text.Append(";gcPauseMs=").Append((long)GC.GetTotalPauseDuration().TotalMilliseconds);
++            text.Append(";lastPauseMs=").Append(PauseMilliseconds(info).ToString("F1", CultureInfo.InvariantCulture));
++            GCMemoryInfo blocking = GC.GetGCMemoryInfo(GCKind.FullBlocking);
++            text.Append(";lastBlockingGc=").Append(blocking.Index).Append(':')
++                .Append(PauseMilliseconds(blocking).ToString("F1", CultureInfo.InvariantCulture)).Append("ms");
++            return text.ToString();
++        }
++
++        private static double PauseMilliseconds(GCMemoryInfo info)
++        {
++            double total = 0;
++            foreach (TimeSpan pause in info.PauseDurations)
++            {
++                total += pause.TotalMilliseconds;
++            }
++
++            return total;
++        }
++
++        internal static void Log(string reason)
++        {
++            try
++            {
++                Logger.Info?.Print(LogClass.Gpu, $"{Summary()};reason={reason}");
++            }
++            catch (Exception)
++            {
++                // A diagnostics failure must not reach the caller.
++            }
++        }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Metal/MetalRenderer.cs b/src/Ryujinx.Graphics.Metal/MetalRenderer.cs
+index a4263c5..0ef18c7 100644
+--- a/src/Ryujinx.Graphics.Metal/MetalRenderer.cs
++++ b/src/Ryujinx.Graphics.Metal/MetalRenderer.cs
+@@ -49,15 +49,24 @@ namespace Ryujinx.Graphics.Metal
+         internal HashSet<SamplerHolder> Samplers { get; }
+         internal PipelineRecipeStore Recipes { get; }
+         internal bool InitializingRecipes { get; private set; }
+-        internal long RecipeWarmSucceeded, RecipeWarmSkipped, RecipeRecordRejected;
++        internal long RecipeWarmSucceeded, RecipeWarmSkipped, RecipeRecordRejected, RecipeKnownSpeculative, RecipeKnownCreated;
++
++        private static readonly TimeSpan RecipeCheckpointPeriod = TimeSpan.FromSeconds(60);
++        private readonly Timer _recipeCheckpoint;
+ 
+         internal void RecipeRestored() => Interlocked.Increment(ref RecipeWarmSucceeded);
+         internal void RecipeSkipped() => Interlocked.Increment(ref RecipeWarmSkipped);
+         internal void RecipeRejected() => Interlocked.Increment(ref RecipeRecordRejected);
++        internal void RecipeAlreadyKnown(bool speculative)
++        {
++            if (speculative) Interlocked.Increment(ref RecipeKnownSpeculative);
++            else Interlocked.Increment(ref RecipeKnownCreated);
++        }
+ 
+         public MetalRenderer(Func<CAMetalLayer> metalLayer, string pipelineRecipeDirectory = null)
+         {
+             NativeTimingDiagnostics.Initialize();
++            ProgramStageCompilers.Install();
+             _device = MTLDevice.CreateSystemDefaultDevice();
+             Programs = new();
+             Samplers = [];
+@@ -78,6 +87,25 @@ namespace Ryujinx.Graphics.Metal
+             string directory = pipelineRecipeDirectory == null ? null : Path.Combine(pipelineRecipeDirectory, compatibility);
+             Recipes = PipelineRecipeStore.Open(directory, compatibility,
+                 message => Logger.Warning?.Print(LogClass.Gpu, "MetalPipelineRecipes: " + message));
++            // Recipes recorded mid-session survive a kill or crash; the
++            // checkpoint runs on a pool thread and is a no-op when clean.
++            _recipeCheckpoint = new Timer(_ =>
++            {
++                // An exception escaping a timer callback would end the process.
++                try
++                {
++                    Recipes.Checkpoint();
++                    FeedbackStats.LogSummaryIfChanged("periodic");
++                    ProgramCompileWorkers.LogSummaryIfChanged("periodic");
++                    SpeculativePipelines.LogSummaryIfChanged("periodic");
++                    ProgramStageCompilers.LogSummaryIfChanged("periodic");
++                    ManagedMemoryDiagnostics.Log("periodic");
++                }
++                catch (Exception exception)
++                {
++                    Logger.Error?.Print(LogClass.Gpu, $"Metal periodic checkpoint failed: {exception}");
++                }
++            }, null, RecipeCheckpointPeriod, RecipeCheckpointPeriod);
+         }
+ 
+         public void Initialize(GraphicsDebugLevel logLevel)
+@@ -131,7 +159,8 @@ namespace Ryujinx.Graphics.Metal
+         public IProgram CreateProgram(ShaderSource[] shaders, ShaderInfo info)
+         {
+             ProgramCount++;
+-            return new Program(this, _device, shaders, info.ResourceLayout, info.ComputeLocalSize, restoreRecipes: info.FromCache);
++            return new Program(this, _device, shaders, info.ResourceLayout, info.ComputeLocalSize, restoreRecipes: info.FromCache,
++                firstDrawState: info.State);
+         }
+ 
+         public ISampler CreateSampler(SamplerCreateInfo info)
+@@ -318,19 +347,25 @@ namespace Ryujinx.Graphics.Metal
+         {
+             // Close admission and drain program creation before tearing down
+             // resources that a compilation or completed program can depend on.
++            _recipeCheckpoint.Dispose();
+             Program[] programs = Programs.CloseAndSnapshot();
++            Logger.Info?.Print(LogClass.Gpu, ProgramCompileWorkers.Summary());
++            SpeculativePipelines.LogSummaryIfChanged("renderer-dispose");
++            ProgramStageCompilers.LogSummaryIfChanged("renderer-dispose");
++            ManagedMemoryDiagnostics.Log("renderer-dispose");
+             // Only managed descriptor bytes are saved. No compiler or disk IO is
+             // added to the draw path, and the store owns no Metal objects.
+             int recipeCount = Recipes.Count;
+             int recipeAdded = Recipes.AddedCount;
+             Recipes.Dispose();
+-            Logger.Info?.Print(LogClass.Gpu, $"MetalPipelineRecipes: records={recipeCount} added={recipeAdded} warmed={RecipeWarmSucceeded} skipped={RecipeWarmSkipped} recordRejected={RecipeRecordRejected} failure={Recipes.Failure ?? "none"}");
++            Logger.Info?.Print(LogClass.Gpu, $"MetalPipelineRecipes: records={recipeCount} added={recipeAdded} warmed={RecipeWarmSucceeded} skipped={RecipeWarmSkipped} recordRejected={RecipeRecordRejected} knownSpeculative={RecipeKnownSpeculative} knownCreated={RecipeKnownCreated} declinedByLimit={Recipes.DeclinedByLimit} checkpoints={Recipes.Checkpoints} checkpointFailures={Recipes.CheckpointFailures} failure={Recipes.Failure ?? "none"}");
+             BackgroundResources.Dispose();
+ 
+             foreach (Program program in programs)
+             {
+                 program.Dispose();
+             }
++            SpeculativePipelines.LogSummaryIfChanged("programs-disposed");
+ 
+             foreach (SamplerHolder sampler in Samplers)
+             {
+diff --git a/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs b/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
+index 6305a73..f214ab7 100644
+--- a/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
++++ b/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
+@@ -23,6 +23,7 @@ namespace Ryujinx.Graphics.Metal
+         CommandCommit,
+         SyncWait,
+         PresentInterval,
++        ProgramWait,
+     }
+ 
+     /// <summary>
+@@ -70,6 +71,16 @@ namespace Ryujinx.Graphics.Metal
+                 : default;
+         }
+ 
++        // An interval measured by the caller (Stopwatch timestamps) on the current thread.
++        internal static void Record(NativeTimingKind kind, long start, long end)
++        {
++            Initialize();
++            Recorder recorder = Volatile.Read(ref _recorder);
++            if (recorder == null || !recorder.Active) return;
++            try { recorder.Record(kind, start, end, Environment.CurrentManagedThreadId); }
++            catch (Exception error) { recorder.Disable(error); }
++        }
++
+         internal static void PresentInterval()
+         {
+             Initialize();
+@@ -348,6 +359,10 @@ namespace Ryujinx.Graphics.Metal
+                     .Append(",\"dropped_shutdown\":").Append(s.DroppedShutdown)
+                     .Append(",\"writer_errors\":").Append(s.WriterErrors)
+                     .Append(",\"queue_depth\":").Append(s.QueueDepth)
++                    // Process-wide GC pause total and collection counts, so a slow second can be checked for GC.
++                    .Append(",\"gc_pause_ms\":").Append(GC.GetTotalPauseDuration().TotalMilliseconds.ToString("F3", CultureInfo.InvariantCulture))
++                    .Append(",\"gcs\":[").Append(GC.CollectionCount(0)).Append(',').Append(GC.CollectionCount(1))
++                    .Append(',').Append(GC.CollectionCount(2)).Append(']')
+                     .Append(",\"aggregates\":{");
+                 for (int i = 0; i < s.Counts.Length; i++)
+                 {
+diff --git a/src/Ryujinx.Graphics.Metal/Pipeline.cs b/src/Ryujinx.Graphics.Metal/Pipeline.cs
+index f9c5e38..4af8f03 100644
+--- a/src/Ryujinx.Graphics.Metal/Pipeline.cs
++++ b/src/Ryujinx.Graphics.Metal/Pipeline.cs
+@@ -40,11 +40,15 @@ namespace Ryujinx.Graphics.Metal
+         internal CommandBufferEncoder Encoders => Cbs.Encoders;
+         internal EncoderType CurrentEncoderType => Encoders.CurrentEncoderType;
+         internal Texture CreateFeedbackSnapshotTexture(TextureCreateInfo info) => new(_device, _renderer, this, info);
++        internal FeedbackCopyTexture CreateFeedbackCopyTexture(TextureCreateInfo info, MTLTexture view, MTLPixelFormat format) =>
++            new(_device, _renderer, this, info, view, format);
++        internal readonly FeedbackCopyPool FeedbackCopyPool;
+ 
+         public Pipeline(MTLDevice device, MetalRenderer renderer)
+         {
+             _device = device;
+             _renderer = renderer;
++            FeedbackCopyPool = new FeedbackCopyPool(device);
+ 
+             renderer.CommandBufferPool.Initialize(this);
+ 
+@@ -97,7 +101,8 @@ namespace Ryujinx.Graphics.Metal
+             try
+             {
+                 _encoderStateManager.PrepareFeedbackDraw(context);
+-                // Snapshot preparation can have changed Render to Blit. Recheck
++                _encoderStateManager.PrepareFeedbackCopies(context);
++                // Snapshot/copy preparation can have changed Render to Blit. Recheck
+                 // *after* that boundary, before writing any argument buffers.
+                 if (CurrentEncoderType != EncoderType.Render)
+                     _encoderStateManager.SignalRenderDirty();
+@@ -123,6 +128,16 @@ namespace Ryujinx.Graphics.Metal
+ 
+         private void FinishFeedbackDraw() => _encoderStateManager.FinishFeedbackDraw();
+ 
++        // The guard throws before the render encoder is ensured, so a rejected draw
++        // is never encoded. Drop that one draw instead of ending the process: the
++        // unsupported alias still never reaches the GPU. This is degraded rendering;
++        // every skip is counted by class (FeedbackStats) and reported at shutdown.
++        private void SkipFeedbackDraw(RenderFeedbackGuard.FeedbackGuardException failure)
++        {
++            _encoderStateManager.SignalRenderDirty();
++            RenderFeedbackGuard.CountSkippedDraw(failure);
++        }
++
+         public MTLBlitCommandEncoder GetOrCreateBlitEncoder()
+         {
+             return Cbs.Encoders.EnsureBlitEncoder();
+@@ -184,7 +199,14 @@ namespace Ryujinx.Graphics.Metal
+             else
+                 registrationStatus = observe ? phase.Register(drawable.NativePtr, timing.Sequence) : -1;
+             long beforePresent = observe ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+-            Cbs.CommandBuffer.PresentDrawable(drawable);
++            if (PresentPacing.Active)
++            {
++                PresentPacing.Present(Cbs.CommandBuffer.NativePtr, drawable.NativePtr);
++            }
++            else
++            {
++                Cbs.CommandBuffer.PresentDrawable(drawable);
++            }
+ 
+             FlushCommandsImpl();
+             if (observe)
+@@ -487,6 +509,10 @@ namespace Ryujinx.Graphics.Metal
+                 }
+             }
+             }
++            catch (RenderFeedbackGuard.FeedbackGuardException failure)
++            {
++                SkipFeedbackDraw(failure);
++            }
+             finally
+             {
+                 FinishFeedbackDraw();
+@@ -587,6 +613,10 @@ namespace Ryujinx.Graphics.Metal
+                 _encoderStateManager.ReportFeedbackDrawEncoded();
+             }
+             }
++            catch (RenderFeedbackGuard.FeedbackGuardException failure)
++            {
++                SkipFeedbackDraw(failure);
++            }
+             finally
+             {
+                 FinishFeedbackDraw();
+@@ -632,6 +662,10 @@ namespace Ryujinx.Graphics.Metal
+                 _encoderStateManager.ReportFeedbackDrawEncoded();
+             }
+             }
++            catch (RenderFeedbackGuard.FeedbackGuardException failure)
++            {
++                SkipFeedbackDraw(failure);
++            }
+             finally
+             {
+                 FinishFeedbackDraw();
+@@ -676,6 +710,10 @@ namespace Ryujinx.Graphics.Metal
+                 (ulong)(indirectBuffer.Offset + offset));
+             _encoderStateManager.ReportFeedbackDrawEncoded();
+             }
++            catch (RenderFeedbackGuard.FeedbackGuardException failure)
++            {
++                SkipFeedbackDraw(failure);
++            }
+             finally
+             {
+                 FinishFeedbackDraw();
+@@ -964,6 +1002,8 @@ namespace Ryujinx.Graphics.Metal
+         {
+             EndCurrentPass();
+             _encoderStateManager.Dispose();
++            FeedbackStats.LogSummary("renderer-dispose");
++            FeedbackCopyPool.Dispose();
+         }
+     }
+ }
+diff --git a/src/Ryujinx.Graphics.Metal/PipelineRecipeStore.cs b/src/Ryujinx.Graphics.Metal/PipelineRecipeStore.cs
+index 417963b..4b824e4 100644
+--- a/src/Ryujinx.Graphics.Metal/PipelineRecipeStore.cs
++++ b/src/Ryujinx.Graphics.Metal/PipelineRecipeStore.cs
+@@ -5,15 +5,20 @@ using System.IO;
+ using System.Linq;
+ using System.Security.Cryptography;
+ using System.Text;
++using System.Threading;
+ 
+ namespace Ryujinx.Graphics.Metal;
+ 
+ internal sealed class PipelineRecipeStore : IDisposable
+ {
+-    private const int MaxRecords = 8192;
++    // Every recorded pipeline is rebuilt at boot (and so lands in Apple's cache);
++    // unrecorded variants compile on first draw (~25 ms each when new). Three
++    // overnight tours reached 8,065 records, so the cap is 16,384 / 32 MiB.
++    // A .57 runtime rejects files above 8,192 records: roll the cache back with it.
++    private const int MaxRecords = 16384;
+     private const int MaxRecordsPerProgramKind = 64;
+     private const int MaxPayloadBytes = 1024;
+-    private const int MaxFileBytes = 16 * 1024 * 1024;
++    private const int MaxFileBytes = 32 * 1024 * 1024;
+     private const int HeaderBytes = 8 + 4 + 32 + 4;
+     private const int FooterBytes = 32;
+     private const int RecordFixedBytes = 32 + 32 + 1 + 2;
+@@ -21,6 +26,18 @@ internal sealed class PipelineRecipeStore : IDisposable
+     private static readonly byte[] Magic = Encoding.ASCII.GetBytes("SCMPRC01");
+ 
+     private readonly object _gate = new();
++    // Orders file writes (checkpoints and the final save). Always taken before _gate.
++    private readonly object _saveGate = new();
++    private int _checkpoints;
++    private int _checkpointFailures;
++    private int _declinedByLimit;
++    private bool _totalLimitLogged;
++    private bool _programKindLimitLogged;
++    private bool _fileLimitLogged;
++
++    public int Checkpoints => Volatile.Read(ref _checkpoints);
++    public int CheckpointFailures => Volatile.Read(ref _checkpointFailures);
++    public int DeclinedByLimit => Volatile.Read(ref _declinedByLimit);
+     private readonly string? _directory;
+     private readonly string? _recipesPath;
+     private readonly string? _lockPath;
+@@ -165,8 +182,10 @@ internal sealed class PipelineRecipeStore : IDisposable
+         }
+     }
+ 
+-    public bool Record(string groupKey, string programKey, byte kind, ReadOnlySpan<byte> payload)
++    // alreadyHeld: the store held this exact record before the call (false for a limit refusal).
++    public bool Record(string groupKey, string programKey, byte kind, ReadOnlySpan<byte> payload, out bool alreadyHeld)
+     {
++        alreadyHeld = false;
+         string normalizedGroupKey = NormalizeKey(groupKey, nameof(groupKey));
+         string normalizedProgramKey = NormalizeKey(programKey, nameof(programKey));
+         ValidateRecipePayload(kind, payload);
+@@ -192,6 +211,7 @@ internal sealed class PipelineRecipeStore : IDisposable
+ 
+             if (_recordIdentities.Contains(identity))
+             {
++                alreadyHeld = true;
+                 return false;
+             }
+ 
+@@ -199,14 +219,28 @@ internal sealed class PipelineRecipeStore : IDisposable
+             _byProgramAndKind.TryGetValue(programKind, out List<Recipe>? sameProgramKind);
+             if (_records.Count >= MaxRecords || (sameProgramKind?.Count ?? 0) >= MaxRecordsPerProgramKind)
+             {
+-                SafeLog($"Pipeline recipe limit reached; declined record ({_records.Count} total, {sameProgramKind?.Count ?? 0} for program/kind).");
++                Interlocked.Increment(ref _declinedByLimit);
++                bool total = _records.Count >= MaxRecords;
++                bool logged = total ? _totalLimitLogged : _programKindLimitLogged;
++                if (!logged)
++                {
++                    // Once per reason: at the cap every unseen variant is declined, and a
++                    // line per draw would flood the log for the rest of the session.
++                    if (total) _totalLimitLogged = true; else _programKindLimitLogged = true;
++                    SafeLog($"Pipeline recipe {(total ? "total" : "per-program/kind")} limit reached; declining such records ({_records.Count} total, {sameProgramKind?.Count ?? 0} for this program/kind). Later declines are counted, not logged.");
++                }
+                 return false;
+             }
+ 
+             long proposedSize = (long)_serializedLength + RecordFixedBytes + payloadCopy.Length;
+             if (proposedSize > MaxFileBytes)
+             {
+-                SafeLog("Pipeline recipe file-size limit reached; declined record.");
++                Interlocked.Increment(ref _declinedByLimit);
++                if (!_fileLimitLogged)
++                {
++                    _fileLimitLogged = true;
++                    SafeLog("Pipeline recipe file-size limit reached; declining new records. Later declines are counted, not logged.");
++                }
+                 return false;
+             }
+ 
+@@ -226,8 +260,48 @@ internal sealed class PipelineRecipeStore : IDisposable
+         }
+     }
+ 
++    // Persists new records at a safe boundary so a killed or crashed session
++    // keeps what it prepared. Runs off the render thread; only the in-memory
++    // snapshot is taken under _gate. The checkpoint's own backup is removed.
++    public bool Checkpoint()
++    {
++        lock (_saveGate)
++        {
++            List<Recipe> snapshot;
++            lock (_gate)
++            {
++                if (_disposed || !_enabled || !_dirty)
++                {
++                    return false;
++                }
++                // Recipes are immutable; copying the list keeps the render
++                // thread's Record path off the serialization cost.
++                snapshot = [.. _records];
++                _dirty = false;
++            }
++
++            try
++            {
++                SaveAtomically(Serialize(snapshot, _compatibilityHash), keepBackup: false);
++                Interlocked.Increment(ref _checkpoints);
++                return true;
++            }
++            catch (Exception exception)
++            {
++                lock (_gate)
++                {
++                    _dirty = true;
++                }
++                Interlocked.Increment(ref _checkpointFailures);
++                SafeLog($"Pipeline recipe checkpoint failed: {exception}");
++                return false;
++            }
++        }
++    }
++
+     public void Dispose()
+     {
++        lock (_saveGate)
+         lock (_gate)
+         {
+             if (_disposed)
+@@ -241,7 +315,8 @@ internal sealed class PipelineRecipeStore : IDisposable
+             {
+                 if (_enabled && _dirty)
+                 {
+-                    SaveAtomically();
++                    SaveAtomically(Serialize(_records, _compatibilityHash), keepBackup: true);
++                    _dirty = false;
+                 }
+             }
+             catch (Exception exception)
+@@ -312,9 +387,8 @@ internal sealed class PipelineRecipeStore : IDisposable
+         _groups.Add(new GroupKindKey(recipe.GroupHex, recipe.Kind));
+     }
+ 
+-    private void SaveAtomically()
++    private void SaveAtomically(byte[] bytes, bool keepBackup)
+     {
+-        byte[] bytes = Serialize(_records, _compatibilityHash);
+         VerifyBaselineUnchanged();
+ 
+         string recipesPath = _recipesPath!;
+@@ -333,6 +407,7 @@ internal sealed class PipelineRecipeStore : IDisposable
+ 
+             VerifyBaselineUnchanged();
+ 
++            string? backupFailure = null;
+             if (_baselineWasMissing)
+             {
+                 File.Move(temporaryPath, recipesPath);
+@@ -349,19 +424,39 @@ internal sealed class PipelineRecipeStore : IDisposable
+                 CacheSnapshot? backup = ReadSnapshotIfPresent(backupPath);
+                 if (backup is null || _baselineFingerprint is null || !FingerprintsEqual(backup.Fingerprint, _baselineFingerprint))
+                 {
+-                    throw new IOException("Atomic replacement did not preserve the prior recipe file in its backup.");
++                    backupFailure = "Atomic replacement did not preserve the prior recipe file in its backup.";
++                }
++                else if (!keepBackup)
++                {
++                    try
++                    {
++                        EnsureNoReparsePointInPath(backupPath);
++                        File.Delete(backupPath);
++                    }
++                    catch (Exception exception)
++                    {
++                        SafeLog($"Could not remove checkpoint backup {backupPath}: {exception.GetType().Name}: {exception.Message}");
++                    }
+                 }
+             }
+ 
++            // The replacement has committed: re-baseline from the file now on
++            // disk before any verification can throw, so one failed check does
++            // not make every later save report an external change.
+             CacheSnapshot? saved = ReadSnapshotIfPresent(recipesPath);
++            if (saved is not null)
++            {
++                _baselineWasMissing = false;
++                _baselineFingerprint = saved.Fingerprint;
++            }
++            if (backupFailure is not null)
++            {
++                throw new IOException(backupFailure);
++            }
+             if (saved is null || !saved.Bytes.AsSpan().SequenceEqual(bytes))
+             {
+                 throw new IOException("Saved recipe file does not match the committed bytes.");
+             }
+-
+-            _baselineWasMissing = false;
+-            _baselineFingerprint = saved.Fingerprint;
+-            _dirty = false;
+         }
+         finally
+         {
+diff --git a/source58/src/Ryujinx.Graphics.Metal/PresentPacing.cs b/src/Ryujinx.Graphics.Metal/PresentPacing.cs
+new file mode 100644
+index 0000000..0810de0
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/PresentPacing.cs
+@@ -0,0 +1,87 @@
++using System;
++using System.Diagnostics;
++using System.Globalization;
++using System.Runtime.InteropServices;
++using System.Runtime.Versioning;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Present pacing for variable-refresh displays. Guest frames reach the host with about
++    // +/-1.5 ms of alternating jitter; presented as soon as ready, a display with 4.167 ms
++    // timing granularity shows them for 12.5/20.8 ms alternately. Policies, only while VSync is Switch:
++    //  - Schedule (default 10 ms; SMASH_COUCH_PRESENT_SCHEDULE_LEAD_MS=7..20 overrides, 0 disables):
++    //    present each frame at an exact time, the previous target plus 1/60 s, normally that lead
++    //    after commit. Measured overnight: 8 and 12 ms both gave 100% 16.667 ms cadence; 10 keeps
++    //    4 ms of jitter margin above the resync threshold. A frame too late for
++    //    its slot resynchronizes at the lead (one long interval, no latency ratchet); a lead that
++    //    has grown is shed one 4.167 ms step per frame.
++    //  - SMASH_COUCH_PRESENT_MIN_MS (1..33, only when the schedule is disabled):
++    //    presentDrawable:afterMinimumDuration:.
++    // SharpMetal's wrappers pass the CFTimeInterval in an integer register, so the selectors are
++    // sent directly with the double in d0. Stopwatch and CACurrentMediaTime share mach time.
++    [SupportedOSPlatform("macos")]
++    static partial class PresentPacing
++    {
++        private const string ObjC = "/usr/lib/libobjc.A.dylib";
++        private const double Period = 1.0 / 60.0;
++        private const double Step = 1.0 / 240.0;
++        private const double MinimumLead = 0.006;
++
++        private const string DefaultScheduleLeadMs = "10";
++
++        public static readonly double ScheduleLead = Parse(Environment.GetEnvironmentVariable("SMASH_COUCH_PRESENT_SCHEDULE_LEAD_MS") ?? DefaultScheduleLeadMs, 7, 20);
++        public static readonly double MinimumSeconds = ScheduleLead > 0 ? 0 : Parse(Environment.GetEnvironmentVariable("SMASH_COUCH_PRESENT_MIN_MS"), 1, 33);
++
++        public static volatile bool VSyncSwitch;
++
++        private static readonly IntPtr _atTime = ScheduleLead > 0 ? sel_registerName("presentDrawable:atTime:") : IntPtr.Zero;
++        private static readonly IntPtr _afterMinimumDuration = MinimumSeconds > 0 ? sel_registerName("presentDrawable:afterMinimumDuration:") : IntPtr.Zero;
++
++        // Render-thread only.
++        private static double _lastTarget;
++        public static long Resyncs, Sheds, Scheduled;
++
++        [LibraryImport(ObjC, StringMarshalling = StringMarshalling.Utf8)]
++        private static partial IntPtr sel_registerName(string name);
++
++        [LibraryImport(ObjC, EntryPoint = "objc_msgSend")]
++        private static partial void SendDrawableDouble(IntPtr commandBuffer, IntPtr selector, IntPtr drawable, double seconds);
++
++        public static bool Active => (ScheduleLead > 0 || MinimumSeconds > 0) && VSyncSwitch;
++
++        private static double Parse(string value, double lowMs, double highMs)
++        {
++            return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double ms) && ms >= lowMs && ms <= highMs
++                ? ms / 1000.0
++                : 0;
++        }
++
++        public static void Present(IntPtr commandBuffer, IntPtr drawable)
++        {
++            if (ScheduleLead <= 0)
++            {
++                SendDrawableDouble(commandBuffer, _afterMinimumDuration, drawable, MinimumSeconds);
++                return;
++            }
++
++            double now = Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
++            double target = _lastTarget + Period;
++            if (_lastTarget == 0 || target < now + MinimumLead)
++            {
++                target = now + ScheduleLead;
++                Resyncs++;
++            }
++            else if (target > now + ScheduleLead + Step * 1.5)
++            {
++                target = Math.Max(now + ScheduleLead, target - Step);
++                Sheds++;
++            }
++
++            _lastTarget = target;
++            Scheduled++;
++            SendDrawableDouble(commandBuffer, _atTime, drawable, target);
++        }
++
++        public static void Reset() => _lastTarget = 0;
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Metal/Program.cs b/src/Ryujinx.Graphics.Metal/Program.cs
+index 85104f7..13bc842 100644
+--- a/src/Ryujinx.Graphics.Metal/Program.cs
++++ b/src/Ryujinx.Graphics.Metal/Program.cs
+@@ -11,6 +11,8 @@ using System.Runtime.InteropServices;
+ using System.Runtime.Versioning;
+ using System.Security.Cryptography;
+ using System.Text;
++using System.Threading;
++using System.Threading.Tasks;
+ 
+ namespace Ryujinx.Graphics.Metal
+ {
+@@ -32,7 +34,10 @@ namespace Ryujinx.Graphics.Metal
+     [SupportedOSPlatform("macos")]
+     class Program : IProgram
+     {
+-        private readonly ProgramLinkStatus _status;
++        private volatile ProgramLinkStatus _status;
++        // Boot-cached programs compile on ProgramCompileWorkers; null when the
++        // constructor compiled synchronously. Every native use waits first.
++        private Task _compile;
+ 
+         private readonly MetalRenderer _renderer;
+ 
+@@ -45,20 +50,70 @@ namespace Ryujinx.Graphics.Metal
+         internal bool UsesPointTransport { get; }
+         private readonly Program _transportRoot;
+         private readonly MTLDevice _transportDevice;
+-        private readonly ShaderSource[] _transportSources;
++        // Original sources for a point variant; compacted once compiled.
++        private readonly TransportSourceArchive _transportSources;
+         private readonly ResourceLayout _transportLayout;
+         private readonly DepthSnapshotShaderPolicy _transportSnapshotPolicy;
+         private readonly object _variantGate = new();
+         private Program _pointVariant;
+         private bool _disposed;
+         private readonly string _recipeGroupKey;
+-        private readonly string _recipeProgramKey;
+-        private readonly byte _recipeKind;
++        private string _recipeProgramKey;
++        private byte _recipeKind;
+ 
+         private HashTableSlim<PipelineUid, MTLRenderPipelineState> _graphicsPipelineCache;
+         private MTLComputePipelineState? _computePipelineCache;
+         private bool _firstBackgroundUse;
+ 
++        // A mid-game program's predicted first-draw pipeline (SpeculativePipelines).
++        // The compile work item creates it before the status is published, so the
++        // render thread reads it only after it saw the status. A speculative
++        // builder thread may start the build only while it is still Queued; the
++        // render thread or Dispose may cancel it only then. Whoever leaves the
++        // build (builder when done, canceller otherwise) completes Built, and
++        // Pipeline is read only after Built completed.
++        private sealed class Speculation
++        {
++            internal const int Queued = 0, Building = 1, Done = 2, Cancelled = 3;
++
++            internal PipelineState Request;
++            internal PipelineUid PredictedKey;
++            internal bool PredictionPending = true;
++            internal bool Offered;
++            internal int State;
++            internal readonly TaskCompletionSource Built = new(TaskCreationOptions.RunContinuationsAsynchronously);
++            internal MTLRenderPipelineState Pipeline;
++
++            // Not offered (shadow mode): prediction counters only, nothing to build.
++            internal Speculation(PipelineState request, bool offered)
++            {
++                Request = request;
++                PredictedKey = request.Internal;
++                Offered = offered;
++                State = offered ? Queued : Cancelled;
++                if (!offered)
++                {
++                    Built.TrySetResult();
++                }
++            }
++
++            internal bool TryCancel()
++            {
++                if (Interlocked.CompareExchange(ref State, Cancelled, Queued) != Queued)
++                {
++                    return false;
++                }
++
++                Built.TrySetResult();
++                return true;
++            }
++        }
++
++        private Speculation _speculation;
++
++        // Set while recorded recipes are rebuilt, so those rebuilds are not counted as already-known recipes.
++        private bool _restoringRecipes;
++
+         public ResourceBindingSegment[][] BindingSegments { get; }
+         // This is only the program-level resource contract. Exact layout and
+         // read-only attachment/native-resource checks are repeated every draw.
+@@ -89,9 +144,11 @@ namespace Ryujinx.Graphics.Metal
+             ShaderSource[] shaders,
+             ResourceLayout resourceLayout,
+             ComputeSize computeLocalSize = default,
+-            bool restoreRecipes = false)
++            bool restoreRecipes = false,
++            ProgramPipelineState? firstDrawState = null)
+             : this(renderer, device, shaders, resourceLayout, computeLocalSize,
+-                   DepthSnapshotShaderPolicy.ReadOnlyFamily, null, restoreRecipes, authenticCapturePublicRoute: true)
++                   DepthSnapshotShaderPolicy.ReadOnlyFamily, null, restoreRecipes, authenticCapturePublicRoute: true,
++                   firstDrawState: firstDrawState)
+         {
+         }
+ 
+@@ -115,7 +172,8 @@ namespace Ryujinx.Graphics.Metal
+             DepthSnapshotShaderPolicy snapshotPolicy,
+             Program transportRoot,
+             bool restoreRecipes = false,
+-            bool authenticCapturePublicRoute = false)
++            bool authenticCapturePublicRoute = false,
++            ProgramPipelineState? firstDrawState = null)
+         {
+             if (shaders.Length == 0)
+                 throw new ArgumentException("A Metal program requires at least one shader.", nameof(shaders));
+@@ -126,10 +184,12 @@ namespace Ryujinx.Graphics.Metal
+             _transportSnapshotPolicy = snapshotPolicy;
+             UsesPointTransport = transportRoot != null;
+             ComputeLocalSize = computeLocalSize;
+-            using var creation = renderer.Programs.BeginCreate() ?? throw new ObjectDisposedException(nameof(MetalRenderer));
++            var creation = renderer.Programs.BeginCreate() ?? throw new ObjectDisposedException(nameof(MetalRenderer));
++            bool creationTransferred = false;
++            try
++            {
+             (BindingSegments, ArgumentBufferSizes, FragArgumentBufferSizes) = BuildBindingSegments(resourceLayout.SetUsages);
+             using NSAutoreleasePool pool = new();
+-            HashSet<ShaderStage> stages = [];
+ 
+             try
+             {
+@@ -152,7 +212,7 @@ namespace Ryujinx.Graphics.Metal
+                         throw new InvalidOperationException("Point variant requires authenticated transport sources.");
+                     if (usesTransport && !UsesPointTransport)
+                     {
+-                        _transportSources = (ShaderSource[])originals.Clone();
++                        _transportSources = new TransportSourceArchive(originals);
+                         _transportLayout = CopyLayout(resourceLayout);
+                     }
+                 }
+@@ -198,43 +258,131 @@ namespace Ryujinx.Graphics.Metal
+                     }
+                     FeedbackResourceUsages = usages.ToArray();
+                 }
++                if (renderer.Recipes.Enabled)
++                {
++                    bool compute = Array.Exists(shaders, shader => shader.Stage == ShaderStage.Compute);
++                    _recipeKind = compute ? (byte)3
++                        : UsesPointTransport ? (byte)2 : UsesPerVertexTransport ? (byte)1 : (byte)0;
++                    _recipeProgramKey = PipelineRecipeIdentity.Program(_recipeGroupKey, shaders,
++                        _recipeKind, (ulong)ShaderLanguageVersion, FeedbackPreserveInvariance, false);
++                }
++            }
++            catch (ShaderCompilationException exception)
++            {
++                _status = ProgramLinkStatus.Failure;
++                Logger.Error?.Print(LogClass.Gpu, exception.Message);
++            }
++
++            // Guest programs compile on the bounded workers. At boot the disk
++            // cache loader keeps several in flight and waits through
++            // CheckProgramLink(true). Mid-game, the threaded renderer's
++            // ProgramQueue starts later-queued programs while SetProgram waits
++            // for an earlier one, so a burst of new shaders compiles in
++            // parallel instead of one after another on the render thread.
++            // Helpers and transport variants stay synchronous.
++            if (_status != ProgramLinkStatus.Failure && transportRoot == null &&
++                !renderer.InitializingRecipes && ProgramCompileWorkers.Enabled)
++            {
++                ShaderSource[] compileSources = shaders;
++                ProgramLinkStatus prior = _status;
++                _status = ProgramLinkStatus.Incomplete;
++                // Only mid-game programs are speculated (SpeculativePipelines).
++                ProgramPipelineState? speculativeState =
++                    !restoreRecipes && SpeculativePipelines.Enabled ? firstDrawState : null;
++                // _compile completes once CompileRegisterRestore has published
++                // the status (faulted if it threw). It is assigned before the
++                // work is queued, so no thread can see the program without it.
++                TaskCompletionSource compiled = new(TaskCreationOptions.RunContinuationsAsynchronously);
++                _compile = compiled.Task;
++                try
++                {
++                    ProgramCompileWorkers.Run(() =>
++                    {
++                        bool speculate;
++                        try
++                        {
++                            speculate = CompileRegisterRestore(device, compileSources, creation, restoreRecipes, background: true,
++                                speculativeState);
++                        }
++                        catch (Exception exception)
++                        {
++                            // EnsureCompiled observes and reports it.
++                            compiled.TrySetException(exception);
++                            return;
++                        }
++                        compiled.TrySetResult();
++                        // The build runs on the speculative builders, never on
++                        // the compile workers, so it cannot delay a compile.
++                        if (speculate) QueueSpeculativeBuild(device);
++                        // After publishing: compacting adds nothing to a wait.
++                        _transportSources?.Compact();
++                    });
++                    creationTransferred = true;
++                    return;
++                }
++                catch (Exception exception)
++                {
++                    _compile = null;
++                    _status = prior;
++                    ProgramCompileWorkers.CountFailure();
++                    Logger.Error?.Print(LogClass.Gpu, $"MetalProgramWorkers: could not queue background compile; compiling synchronously: {exception}");
++                }
++            }
++
++            CompileRegisterRestore(device, shaders, creation, restoreRecipes, background: false);
++            _transportSources?.Compact();
++            }
++            finally
++            {
++                if (!creationTransferred) creation.Dispose();
++            }
++        }
++
++        // Returns true when the work item should build a speculative pipeline
++        // after this method has published the status.
++        private bool CompileRegisterRestore(MTLDevice device, ShaderSource[] shaders,
++            ProgramCreationRegistry<Program>.CreationLease creation, bool restoreRecipes, bool background,
++            ProgramPipelineState? speculativeState = null)
++        {
++            using NSAutoreleasePool pool = new();
++            ProgramLinkStatus status = _status;
++            bool speculate = false;
++            try
++            {
++            if (status != ProgramLinkStatus.Failure)
++            {
++            HashSet<ShaderStage> stages = [];
++            // Mid-game vertex+fragment programs: the render thread is waiting for
++            // this program, so the fragment stage compiles beside the vertex stage
++            // when a stage thread is idle (ProgramStageCompilers).
++            Task<MTLFunction> fragmentStage = null;
++            try
++            {
+                 foreach (ShaderSource shader in shaders)
+                 {
+                     if (!stages.Add(shader.Stage))
+                         throw new ShaderCompilationException($"Duplicate Metal shader stage {shader.Stage}.");
+-                    string entry = shader.Stage switch
+-                    {
+-                        ShaderStage.Compute => "kernelMain",
+-                        ShaderStage.Vertex => "vertexMain",
+-                        ShaderStage.Fragment => "fragmentMain",
+-                        _ => throw new ShaderCompilationException($"Unsupported Metal shader stage {shader.Stage}."),
+-                    };
+-                    using MTLCompileOptions options = new()
+-                    {
+-                        PreserveInvariance = FeedbackPreserveInvariance,
+-                        LanguageVersion = ShaderLanguageVersion,
+-                        // Guest floating-point instructions may produce zero,
+-                        // infinity or NaN. Do not assume finite-only arithmetic.
+-                        FastMathEnabled = false,
+-                    };
+-                    NSError error = default;
+-                    MTLLibrary compiledLibrary;
+-                    using (NativeTimingDiagnostics.Measure(NativeTimingKind.ShaderLibrary))
++                }
++                if (background && !restoreRecipes && shaders.Length == 2 &&
++                    shaders[0].Stage == ShaderStage.Vertex && shaders[1].Stage == ShaderStage.Fragment)
++                {
++                    ShaderSource fragmentSource = shaders[1];
++                    fragmentStage = ProgramStageCompilers.TryStart(() => CompileStage(device, fragmentSource));
++                }
++                foreach (ShaderSource shader in shaders)
++                {
++                    MTLFunction function;
++                    if (fragmentStage != null && shader.Stage == ShaderStage.Fragment)
+                     {
+-                        compiledLibrary = device.NewLibrary(StringHelper.NSString(shader.Code), options, ref error);
++                        Task<MTLFunction> stage = fragmentStage;
++                        fragmentStage = null;
++                        // Rethrows the stage's own exception, as if compiled here.
++                        function = stage.GetAwaiter().GetResult();
+                     }
+-                    using MTLLibrary library = compiledLibrary;
+-                    if (library.NativePtr == IntPtr.Zero)
++                    else
+                     {
+-                        string details = ErrorDescription(error);
+-                        throw new ShaderCompilationException($"{shader.Stage} Metal compilation failed: {details}");
++                        function = CompileStage(device, shader);
+                     }
+-                    if (error != IntPtr.Zero)
+-                        Logger.Warning?.Print(LogClass.Gpu, $"{shader.Stage} Metal compiler message: {ErrorDescription(error)}");
+-
+-                    MTLFunction function = library.NewFunction(StringHelper.NSString(entry));
+-                    if (function.NativePtr == IntPtr.Zero)
+-                        throw new ShaderCompilationException($"Metal entry point {entry} is missing.");
+                     switch (shader.Stage)
+                     {
+                         case ShaderStage.Compute: ComputeFunction = function; break;
+@@ -242,64 +390,224 @@ namespace Ryujinx.Graphics.Metal
+                         case ShaderStage.Fragment: FragmentFunction = function; break;
+                     }
+                 }
+-                _status = ProgramLinkStatus.Success;
+-                if (renderer.Recipes.Enabled)
+-                {
+-                    _recipeKind = ComputeFunction.NativePtr != IntPtr.Zero ? (byte)3
+-                        : UsesPointTransport ? (byte)2 : UsesPerVertexTransport ? (byte)1 : (byte)0;
+-                    _recipeProgramKey = PipelineRecipeIdentity.Program(_recipeGroupKey, shaders,
+-                        _recipeKind, (ulong)ShaderLanguageVersion, FeedbackPreserveInvariance, false);
+-                }
++                status = ProgramLinkStatus.Success;
+             }
+             catch (ShaderCompilationException exception)
+             {
+                 // Existing IProgram callers inspect a terminal Failure and own
+                 // disposal; shader failures must not escape their compile queue.
+                 DisposeShaderFunctions();
+-                _status = ProgramLinkStatus.Failure;
++                status = ProgramLinkStatus.Failure;
+                 Logger.Error?.Print(LogClass.Gpu, exception.Message);
+             }
++            catch (Exception exception) when (background)
++            {
++                status = ProgramLinkStatus.Failure;
++                ProgramCompileWorkers.CountFailure();
++                Logger.Error?.Print(LogClass.Gpu, $"Metal background program compile failed (program {_recipeProgramKey ?? "unkeyed"}): {exception}");
++                DisposeShaderFunctions();
++            }
+             catch
+             {
+                 DisposeShaderFunctions();
+                 throw;
+             }
++            finally
++            {
++                // The vertex stage failed first: the fragment stage still running
++                // finishes before the program is published or disposed, unused.
++                if (fragmentStage != null)
++                {
++                    try
++                    {
++                        MTLFunction unused = fragmentStage.GetAwaiter().GetResult();
++                        if (unused.NativePtr != IntPtr.Zero) unused.Dispose();
++                    }
++                    catch (Exception)
++                    {
++                        // Its failure is moot; the program already failed.
++                    }
++                }
++            }
++            }
+ 
+-            if (!renderer.Programs.Register(this, creation))
++            if (!_renderer.Programs.Register(this, creation))
+             {
+                 DisposeShaderFunctions();
+-                throw new InvalidOperationException("Metal program registration lost creation ownership.");
++                if (!background)
++                    throw new InvalidOperationException("Metal program registration lost creation ownership.");
++                Logger.Error?.Print(LogClass.Gpu, "Metal program registration lost creation ownership.");
++                status = ProgramLinkStatus.Failure;
+             }
+ 
+-            // The existing creation lease remains held through synchronous
+-            // restoration. Never bulk-compile historical variants for a newly
+-            // created mid-game program. Helpers initialize before gameplay.
+-            if (_status == ProgramLinkStatus.Success && renderer.Recipes.Enabled &&
+-                (restoreRecipes || renderer.InitializingRecipes))
++            // The existing creation lease remains held through restoration.
++            // Never bulk-compile historical variants for a newly created
++            // mid-game program. Helpers initialize before gameplay.
++            if (status == ProgramLinkStatus.Success && _renderer.Recipes.Enabled &&
++                (restoreRecipes || _renderer.InitializingRecipes))
+             {
+                 try
+                 {
+                     RestoreRecipes(device);
+                     if (UsesPerVertexTransport && !UsesPointTransport &&
+-                        renderer.Recipes.HasGroup(_recipeGroupKey, 2))
++                        _renderer.Recipes.HasGroup(_recipeGroupKey, 2))
+                     {
+                         try { ResolveForPrimitiveCore(MTLPrimitiveType.Point, true); }
+                         catch (InvalidOperationException exception)
+                         {
+-                            renderer.RecipeSkipped();
++                            _renderer.RecipeSkipped();
+                             Logger.Warning?.Print(LogClass.Gpu, "MetalPipelineRecipes: point restore skipped: " + exception.Message);
+                         }
+                     }
+                 }
++                catch (Exception exception) when (background)
++                {
++                    status = ProgramLinkStatus.Failure;
++                    ProgramCompileWorkers.CountFailure();
++                    Logger.Error?.Print(LogClass.Gpu, $"Metal background recipe restore failed (program {_recipeProgramKey ?? "unkeyed"}): {exception}");
++                    DisposeCore();
++                }
+                 catch
+                 {
+                     Dispose();
+                     throw;
+                 }
+             }
++
++            // Mid-game programs on a worker, before the status is published:
++            // predict the requesting draw's key (cheap). The pipeline itself is
++            // built after publication on the speculative builders, so the render
++            // thread's wait for this program never includes it.
++            if (background && status == ProgramLinkStatus.Success && speculativeState.HasValue &&
++                VertexFunction.NativePtr != IntPtr.Zero &&
++                SpeculativePipelines.TryPredict(speculativeState.Value, UsesPerVertexTransport, out PipelineState request))
++            {
++                speculate = SpeculativePipelines.Mode == SpeculativePipelines.SpeculationMode.On;
++                _speculation = new Speculation(request, speculate);
++            }
++            }
++            finally
++            {
++                _status = status;
++                if (background) creation.Dispose();
++            }
++            return speculate;
++        }
++
++        // Compile worker, after the status is published. If the builders cannot
++        // start, the build is cancelled and a draw creates the pipeline normally.
++        private void QueueSpeculativeBuild(MTLDevice device)
++        {
++            Speculation speculation = _speculation;
++            if (!SpeculativePipelines.Queue(() => BuildSpeculativePipeline(device, speculation)))
++            {
++                speculation.TryCancel();
++            }
++        }
++
++        // Speculative builder thread: builds the predicted pipeline detached from
++        // _graphicsPipelineCache, which the render thread may be using, unless
++        // the build was cancelled first.
++        private void BuildSpeculativePipeline(MTLDevice device, Speculation speculation)
++        {
++            if (Interlocked.CompareExchange(ref speculation.State, Speculation.Building, Speculation.Queued) != Speculation.Queued)
++            {
++                return;
++            }
++
++            try
++            {
++                using NSAutoreleasePool pool = new();
++                speculation.Pipeline = SpeculativePipelines.Build(device, this, ref speculation.Request);
++            }
++            finally
++            {
++                Volatile.Write(ref speculation.State, Speculation.Done);
++                speculation.Built.TrySetResult();
++            }
++        }
++
++        // Render thread, before each pipeline lookup for this program: the first
++        // request is compared with the prediction (counters only). A build for a
++        // wrong prediction that has not started yet is cancelled.
++        internal void ObservePipelineRequest(ref PipelineUid key)
++        {
++            Speculation speculation = _speculation;
++            if (speculation == null || !speculation.PredictionPending) return;
++            speculation.PredictionPending = false;
++            if (!SpeculativePipelines.ObserveFirstUse(ref speculation.PredictedKey, ref key) && speculation.TryCancel())
++            {
++                speculation.Offered = false;
++                SpeculativePipelines.CountCancelled();
++            }
++        }
++
++        // Render thread, on a pipeline cache miss for exactly the predicted key:
++        // takes the speculative pipeline, waiting only if its build is already
++        // running. A build that has not started is cancelled and the caller
++        // creates the pipeline as without speculation. Taken at most once.
++        private bool TakeSpeculativePipeline(ref PipelineUid key, out MTLRenderPipelineState pipeline)
++        {
++            pipeline = default;
++            Speculation speculation = _speculation;
++            if (speculation == null || !speculation.Offered || !key.Equals(ref speculation.PredictedKey))
++            {
++                return false;
++            }
++
++            speculation.Offered = false;
++            if (speculation.TryCancel())
++            {
++                SpeculativePipelines.CountPreempted();
++                return false;
++            }
++
++            SpeculativePipelines.WaitForBuild(speculation.Built.Task, counted: true);
++            pipeline = speculation.Pipeline;
++            speculation.Pipeline = default;
++            if (pipeline.NativePtr == IntPtr.Zero)
++            {
++                // Build failed (counted there); the caller creates it normally.
++                return false;
++            }
++
++            (_graphicsPipelineCache ??= new()).Add(ref key, pipeline);
++            RecordRecipe(ref key, speculative: true);
++            SpeculativePipelines.CountHit();
++            return true;
++        }
++
++        // Waits for a boot-cached program's background compile. Called before
++        // any use of its native functions, pipelines or variants.
++        internal void EnsureCompiled()
++        {
++            Task compile = _compile;
++            if (compile == null) return;
++            if (!compile.IsCompleted) ProgramCompileWorkers.Wait(compile);
++            if (compile.IsFaulted && _status != ProgramLinkStatus.Failure)
++            {
++                // CompileRegisterRestore publishes its status in a finally, so
++                // this is only reachable if that publication itself failed.
++                _status = ProgramLinkStatus.Failure;
++                ProgramCompileWorkers.CountFailure();
++                Logger.Error?.Print(LogClass.Gpu, $"Metal background program work faulted (program {_recipeProgramKey ?? "unkeyed"}): {compile.Exception?.InnerException}");
++            }
+         }
+ 
+         private void RestoreRecipes(MTLDevice device)
++        {
++            _restoringRecipes = true;
++            try
++            {
++                RestoreRecipesCore(device);
++            }
++            finally
++            {
++                _restoringRecipes = false;
++            }
++        }
++
++        private void RestoreRecipesCore(MTLDevice device)
+         {
+             foreach (byte[] payload in _renderer.Recipes.Find(_recipeProgramKey, _recipeKind))
+             {
+@@ -358,10 +666,13 @@ namespace Ryujinx.Graphics.Metal
+         private Program ResolveForPrimitiveCore(MTLPrimitiveType primitiveType, bool restoreRecipes)
+         {
+             Program root = _transportRoot;
++            if (!restoreRecipes) root.EnsureCompiled();
+             lock (root._variantGate)
+             {
+                 ObjectDisposedException.ThrowIf(root._disposed, root);
+-                if (root._status != ProgramLinkStatus.Success)
++                // Restoration runs before the linked status is published; its
++                // caller has already established a successful compile.
++                if (root._status != ProgramLinkStatus.Success && !restoreRecipes)
+                     throw new InvalidOperationException("Cannot select a variant of an unlinked Metal program.");
+                 if (!root.UsesPerVertexTransport) return root;
+                 EncoderStateManager.ValidateTransportTopology(true, primitiveType);
+@@ -372,7 +683,7 @@ namespace Ryujinx.Graphics.Metal
+                     return root._pointVariant;
+                 }
+ 
+-                Program variant = new(root._renderer, root._transportDevice, root._transportSources,
++                Program variant = new(root._renderer, root._transportDevice, root._transportSources.Expand(),
+                     root._transportLayout, root.ComputeLocalSize, root._transportSnapshotPolicy, root, restoreRecipes);
+                 if (variant._status != ProgramLinkStatus.Success)
+                 {
+@@ -503,7 +814,7 @@ namespace Ryujinx.Graphics.Metal
+ 
+         public ProgramLinkStatus CheckProgramLink(bool blocking)
+         {
+-            // A successfully constructed program is already linked.
++            if (blocking) EnsureCompiled();
+             return _status;
+         }
+ 
+@@ -515,11 +826,24 @@ namespace Ryujinx.Graphics.Metal
+         public void AddGraphicsPipeline(ref PipelineUid key, MTLRenderPipelineState pipeline)
+         {
+             (_graphicsPipelineCache ??= new()).Add(ref key, pipeline);
++            RecordRecipe(ref key, speculative: false);
++        }
++
++        private void RecordRecipe(ref PipelineUid key, bool speculative)
++        {
+             if (_renderer.Recipes.Enabled && _recipeProgramKey != null)
+             {
+                 byte[] payload = PipelineRecipeCodec.Encode(key);
+                 if (PipelineRecipeCodec.TryDecode(payload, out _))
+-                    _renderer.Recipes.Record(_recipeGroupKey, _recipeProgramKey, _recipeKind, payload);
++                {
++                    // A recipe the store already held: a pipeline a mid-game program could have rebuilt from its
++                    // recipes before the draw instead of at it.
++                    _renderer.Recipes.Record(_recipeGroupKey, _recipeProgramKey, _recipeKind, payload, out bool alreadyHeld);
++                    if (alreadyHeld && !_restoringRecipes)
++                    {
++                        _renderer.RecipeAlreadyKnown(speculative);
++                    }
++                }
+                 else _renderer.RecipeRejected();
+             }
+         }
+@@ -528,19 +852,23 @@ namespace Ryujinx.Graphics.Metal
+         {
+             _computePipelineCache = pipeline;
+             if (_renderer.Recipes.Enabled && _recipeProgramKey != null && _recipeKind == 3)
+-                _renderer.Recipes.Record(_recipeGroupKey, _recipeProgramKey, 3, ReadOnlySpan<byte>.Empty);
++                _renderer.Recipes.Record(_recipeGroupKey, _recipeProgramKey, 3, ReadOnlySpan<byte>.Empty, out _);
+         }
+ 
+         public bool TryGetGraphicsPipeline(ref PipelineUid key, out MTLRenderPipelineState pipeline)
+         {
+             if (_graphicsPipelineCache == null)
+             {
+-                pipeline = default;
+-                return false;
++                return TakeSpeculativePipeline(ref key, out pipeline);
+             }
+ 
+             if (!_graphicsPipelineCache.TryGetValue(ref key, out pipeline))
+             {
++                if (TakeSpeculativePipeline(ref key, out pipeline))
++                {
++                    return true;
++                }
++
+                 if (_firstBackgroundUse)
+                 {
+                     Logger.Warning?.Print(LogClass.Gpu, "Background pipeline compile missed on draw - incorrect pipeline state?");
+@@ -568,6 +896,19 @@ namespace Ryujinx.Graphics.Metal
+         }
+ 
+         public void Dispose()
++        {
++            EnsureCompiled();
++            // A queued speculative build is cancelled; a running one must finish
++            // before its pipeline can be disposed.
++            Speculation speculation = _speculation;
++            if (speculation != null && !speculation.TryCancel())
++            {
++                SpeculativePipelines.WaitForBuild(speculation.Built.Task, counted: false);
++            }
++            DisposeCore();
++        }
++
++        private void DisposeCore()
+         {
+             lock (_variantGate)
+             {
+@@ -583,10 +924,58 @@ namespace Ryujinx.Graphics.Metal
+                     }
+                 }
+                 _computePipelineCache?.Dispose();
++                if (_speculation != null && _speculation.Pipeline.NativePtr != IntPtr.Zero)
++                {
++                    // Built, but no draw requested its key.
++                    _speculation.Pipeline.Dispose();
++                    _speculation.Pipeline = default;
++                    SpeculativePipelines.CountUnused();
++                }
+                 DisposeShaderFunctions();
+             }
+         }
+ 
++        // One stage: MSL source to its entry-point function. Runs on the compile
++        // worker, or for a mid-game fragment stage on a stage thread; reads only
++        // members fixed before the program was queued.
++        private MTLFunction CompileStage(MTLDevice device, ShaderSource shader)
++        {
++            string entry = shader.Stage switch
++            {
++                ShaderStage.Compute => "kernelMain",
++                ShaderStage.Vertex => "vertexMain",
++                ShaderStage.Fragment => "fragmentMain",
++                _ => throw new ShaderCompilationException($"Unsupported Metal shader stage {shader.Stage}."),
++            };
++            using MTLCompileOptions options = new()
++            {
++                PreserveInvariance = FeedbackPreserveInvariance,
++                LanguageVersion = ShaderLanguageVersion,
++                // Guest floating-point instructions may produce zero,
++                // infinity or NaN. Do not assume finite-only arithmetic.
++                FastMathEnabled = false,
++            };
++            NSError error = default;
++            MTLLibrary compiledLibrary;
++            using (NativeTimingDiagnostics.Measure(NativeTimingKind.ShaderLibrary))
++            {
++                compiledLibrary = device.NewLibrary(StringHelper.NSString(shader.Code), options, ref error);
++            }
++            using MTLLibrary library = compiledLibrary;
++            if (library.NativePtr == IntPtr.Zero)
++            {
++                string details = ErrorDescription(error);
++                throw new ShaderCompilationException($"{shader.Stage} Metal compilation failed: {details}");
++            }
++            if (error != IntPtr.Zero)
++                Logger.Warning?.Print(LogClass.Gpu, $"{shader.Stage} Metal compiler message: {ErrorDescription(error)}");
++
++            MTLFunction function = library.NewFunction(StringHelper.NSString(entry));
++            if (function.NativePtr == IntPtr.Zero)
++                throw new ShaderCompilationException($"Metal entry point {entry} is missing.");
++            return function;
++        }
++
+         private void DisposeShaderFunctions()
+         {
+             if (VertexFunction.NativePtr != IntPtr.Zero) VertexFunction.Dispose();
+diff --git a/source58/src/Ryujinx.Graphics.Metal/ProgramCompileWorkers.cs b/src/Ryujinx.Graphics.Metal/ProgramCompileWorkers.cs
+new file mode 100644
+index 0000000..2272ddd
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/ProgramCompileWorkers.cs
+@@ -0,0 +1,137 @@
++using Ryujinx.Common.Logging;
++using System;
++using System.Collections.Concurrent;
++using System.Diagnostics;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Bounded worker pool for guest program preparation (MSL library and
++    // function compilation, plus recorded pipelines for disk-cached programs).
++    // MTLDevice library/pipeline creation is thread-safe; each program's own
++    // state is written only by its single work item and published through
++    // Task completion. SMASH_COUCH_PROGRAM_WORKERS=0 restores serial creation.
++    static class ProgramCompileWorkers
++    {
++        private static readonly int Count = ReadCount();
++        private static readonly BlockingCollection<Action> _queue = new();
++        private static readonly object _startGate = new();
++        private static volatile bool _started;
++        private static long _queued;
++        private static long _waits;
++        private static long _waitTicks;
++        private static long _failures;
++        private static readonly object _logGate = new();
++        private static long _loggedQueued;
++        private static long _loggedWaits;
++        private static long _loggedWaitTicks;
++        private static long _loggedFailures;
++
++        internal static void CountFailure() => Interlocked.Increment(ref _failures);
++
++        internal static bool Enabled => Count > 0;
++
++        private static int ReadCount()
++        {
++            string value = Environment.GetEnvironmentVariable("SMASH_COUCH_PROGRAM_WORKERS");
++            if (int.TryParse(value, out int count)) return Math.Clamp(count, 0, 16);
++            return Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
++        }
++
++        internal static Task Run(Action work)
++        {
++            if (!_started)
++            {
++                lock (_startGate)
++                {
++                    if (!_started)
++                    {
++                        // Publish only after every worker is running; if a start
++                        // throws, the caller compiles synchronously instead of
++                        // queueing work that nothing would consume.
++                        for (int index = 0; index < Count; index++)
++                        {
++                            new Thread(Work) { Name = $"Metal.ProgramCompile.{index}", IsBackground = true }.Start();
++                        }
++                        _started = true;
++                        Logger.Info?.Print(LogClass.Gpu, $"MetalProgramWorkers: started {Count} program compile workers");
++                    }
++                }
++            }
++
++            TaskCompletionSource completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
++            Interlocked.Increment(ref _queued);
++            _queue.Add(() =>
++            {
++                try
++                {
++                    work();
++                    completion.SetResult();
++                }
++                catch (Exception exception)
++                {
++                    // Work items convert their own failures to Failure status;
++                    // anything escaping is still surfaced to the waiter.
++                    completion.SetException(exception);
++                }
++            });
++            return completion.Task;
++        }
++
++        private static void Work()
++        {
++            foreach (Action work in _queue.GetConsumingEnumerable())
++            {
++                work();
++            }
++        }
++
++        internal static void Wait(Task compile)
++        {
++            long start = Stopwatch.GetTimestamp();
++            try
++            {
++                compile.Wait();
++            }
++            catch (AggregateException exception)
++            {
++                Logger.Error?.Print(LogClass.Gpu, $"MetalProgramWorkers: background compile threw: {exception.InnerException}");
++            }
++            Interlocked.Increment(ref _waits);
++            Interlocked.Add(ref _waitTicks, Stopwatch.GetTimestamp() - start);
++        }
++
++        internal static string Summary() =>
++            $"MetalProgramWorkers: workers={Count};queued={Interlocked.Read(ref _queued)};pending={_queue.Count};" +
++            $"waits={Interlocked.Read(ref _waits)};waitMs={Interlocked.Read(ref _waitTicks) * 1000.0 / Stopwatch.Frequency:F1};" +
++            $"failures={Interlocked.Read(ref _failures)}";
++
++        // Periodic line with deltas since the previous one. The first line (60 s
++        // in) is the boot cost; later lines isolate mid-game queueing and any
++        // render-thread waits, which the dispose-time total conflates.
++        internal static void LogSummaryIfChanged(string reason)
++        {
++            lock (_logGate)
++            {
++                long queued = Interlocked.Read(ref _queued);
++                long waits = Interlocked.Read(ref _waits);
++                long waitTicks = Interlocked.Read(ref _waitTicks);
++                long failures = Interlocked.Read(ref _failures);
++                if (queued == _loggedQueued && waits == _loggedWaits && failures == _loggedFailures)
++                {
++                    return;
++                }
++
++                Logger.Info?.Print(LogClass.Gpu, Summary() +
++                    $";delta:queued=+{queued - _loggedQueued};waits=+{waits - _loggedWaits};" +
++                    $"waitMs=+{(waitTicks - _loggedWaitTicks) * 1000.0 / Stopwatch.Frequency:F1};" +
++                    $"failures=+{failures - _loggedFailures};reason={reason}");
++                _loggedQueued = queued;
++                _loggedWaits = waits;
++                _loggedWaitTicks = waitTicks;
++                _loggedFailures = failures;
++            }
++        }
++    }
++}
+diff --git a/source58/src/Ryujinx.Graphics.Metal/ProgramStageCompilers.cs b/src/Ryujinx.Graphics.Metal/ProgramStageCompilers.cs
+new file mode 100644
+index 0000000..21726ca
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/ProgramStageCompilers.cs
+@@ -0,0 +1,206 @@
++using Ryujinx.Common.Logging;
++using Ryujinx.Graphics.GAL.Multithreading;
++using SharpMetal.Foundation;
++using SharpMetal.Metal;
++using System;
++using System.Collections.Concurrent;
++using System.Diagnostics;
++using System.Runtime.Versioning;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Parallel stage compilation for mid-game graphics programs.
++    //
++    // A program's stages compile one after another on its compile worker, and
++    // mid-game the render thread waits for the whole program: the threaded
++    // renderer's SetProgram follows CreateProgram (ProgramQueue.WaitForProgram).
++    // The fragment stage of a mid-game vertex+fragment program compiles on a
++    // stage thread while the worker compiles the vertex stage, so that wait is
++    // the longer stage instead of the sum. A stage is handed over only when a
++    // stage thread is idle; otherwise the worker compiles it as before, so a
++    // program never waits behind another program's stage. Boot programs keep
++    // the sequential path; their workers are already saturated.
++    //
++    // Also counts the render thread's waits for programs that were not compiled
++    // yet (reported by the threaded renderer), the stall this targets.
++    //
++    // SMASH_COUCH_PARALLEL_STAGES: on (default) | off.
++    [SupportedOSPlatform("macos")]
++    static class ProgramStageCompilers
++    {
++        internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SMASH_COUCH_PARALLEL_STAGES")?.Trim()
++            .ToLowerInvariant() is not ("off" or "0");
++
++        private static readonly int ThreadCount = Math.Clamp(Environment.ProcessorCount / 4, 1, 4);
++        private static readonly SemaphoreSlim _idle = new(ThreadCount, ThreadCount);
++        private static readonly BlockingCollection<Action> _stages = new();
++        private static readonly object _startGate = new();
++        private static volatile bool _started;
++        private static volatile bool _broken;
++
++        private static long _parallel, _declined, _failed;
++        private static long _renderWaits, _renderWaitTicks, _maxRenderWaitTicks;
++        private static string _lastSummary;
++
++        // Compiles one stage on an idle stage thread. Returns null (and starts
++        // nothing) when no stage thread is idle; the caller compiles the stage.
++        // The returned task completes with the stage's function or faults with
++        // the stage's compile exception; the caller owns the function.
++        internal static Task<MTLFunction> TryStart(Func<MTLFunction> compile)
++        {
++            if (!Enabled || _broken || !EnsureStarted() || !_idle.Wait(0))
++            {
++                Interlocked.Increment(ref _declined);
++                return null;
++            }
++
++            TaskCompletionSource<MTLFunction> result = new(TaskCreationOptions.RunContinuationsAsynchronously);
++            try
++            {
++                _stages.Add(() =>
++                {
++                    MTLFunction function = default;
++                    Exception error = null;
++                    try
++                    {
++                        using NSAutoreleasePool pool = new();
++                        function = compile();
++                    }
++                    catch (Exception exception)
++                    {
++                        Interlocked.Increment(ref _failed);
++                        error = exception;
++                    }
++                    // Free the slot before the waiting worker resumes, so the
++                    // next program already finds this thread idle.
++                    try
++                    {
++                        _idle.Release();
++                    }
++                    finally
++                    {
++                        if (error != null)
++                        {
++                            result.TrySetException(error);
++                        }
++                        else
++                        {
++                            result.TrySetResult(function);
++                        }
++                    }
++                });
++            }
++            catch (Exception exception)
++            {
++                _idle.Release();
++                _broken = true;
++                Logger.Warning?.Print(LogClass.Gpu, $"MetalProgramStages: queue failed, compiling stages in order: {exception.Message}");
++                Interlocked.Increment(ref _declined);
++                return null;
++            }
++
++            Interlocked.Increment(ref _parallel);
++            return result.Task;
++        }
++
++        private static bool EnsureStarted()
++        {
++            if (_started)
++            {
++                return true;
++            }
++
++            lock (_startGate)
++            {
++                if (_started || _broken)
++                {
++                    return _started;
++                }
++
++                try
++                {
++                    for (int index = 0; index < ThreadCount; index++)
++                    {
++                        new Thread(Work) { Name = $"Metal.StageCompile.{index}", IsBackground = true }.Start();
++                    }
++                }
++                catch (Exception exception)
++                {
++                    // Threads already started keep serving the queue; nothing new is handed over.
++                    _broken = true;
++                    Logger.Warning?.Print(LogClass.Gpu, $"MetalProgramStages: could not start stage threads, compiling stages in order: {exception.Message}");
++                    return false;
++                }
++
++                _started = true;
++                Logger.Info?.Print(LogClass.Gpu, $"MetalProgramStages: started {ThreadCount} stage compile threads");
++                return true;
++            }
++        }
++
++        private static void Work()
++        {
++            // Each job completes its own task and releases its slot; nothing escapes.
++            foreach (Action stage in _stages.GetConsumingEnumerable())
++            {
++                stage();
++            }
++        }
++
++        // Render thread (threaded renderer): a SetProgram waited for a program
++        // that had not finished compiling. Diagnostics only; never throws.
++        internal static void ObserveRenderWait(long startTicks, long endTicks)
++        {
++            try
++            {
++                long ticks = Math.Max(0, endTicks - startTicks);
++                Interlocked.Increment(ref _renderWaits);
++                Interlocked.Add(ref _renderWaitTicks, ticks);
++                long max = Interlocked.Read(ref _maxRenderWaitTicks);
++                while (ticks > max)
++                {
++                    long seen = Interlocked.CompareExchange(ref _maxRenderWaitTicks, ticks, max);
++                    if (seen == max)
++                    {
++                        break;
++                    }
++                    max = seen;
++                }
++                NativeTimingDiagnostics.Record(NativeTimingKind.ProgramWait, startTicks, endTicks);
++            }
++            catch (Exception)
++            {
++                // A diagnostics failure must not reach the render thread.
++            }
++        }
++
++        internal static void Install()
++        {
++            ProgramWaitObserver.Observed = ObserveRenderWait;
++        }
++
++        private static string Milliseconds(long ticks) => (ticks * 1000.0 / Stopwatch.Frequency).ToString("F1");
++
++        internal static string Summary()
++        {
++            return $"MetalProgramStages: mode={(Enabled ? "on" : "off")};threads={ThreadCount};" +
++                $"parallel={Interlocked.Read(ref _parallel)};declined={Interlocked.Read(ref _declined)};" +
++                $"failed={Interlocked.Read(ref _failed)};renderWaits={Interlocked.Read(ref _renderWaits)};" +
++                $"renderWaitMs={Milliseconds(Interlocked.Read(ref _renderWaitTicks))};" +
++                $"maxRenderWaitMs={Milliseconds(Interlocked.Read(ref _maxRenderWaitTicks))}";
++        }
++
++        internal static void LogSummaryIfChanged(string reason)
++        {
++            string summary = Summary();
++            if (summary == Volatile.Read(ref _lastSummary))
++            {
++                return;
++            }
++            Volatile.Write(ref _lastSummary, summary);
++            Logger.Info?.Print(LogClass.Gpu, $"{summary};reason={reason}");
++        }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Metal/RenderFeedbackGuard.cs b/src/Ryujinx.Graphics.Metal/RenderFeedbackGuard.cs
+index 6e94cb4..a8f1fd2 100644
+--- a/src/Ryujinx.Graphics.Metal/RenderFeedbackGuard.cs
++++ b/src/Ryujinx.Graphics.Metal/RenderFeedbackGuard.cs
+@@ -4,6 +4,7 @@ using SharpMetal.Metal;
+ using System;
+ using System.Collections.Generic;
+ using System.Runtime.Versioning;
++using System.Threading;
+ 
+ namespace Ryujinx.Graphics.Metal
+ {
+@@ -231,10 +232,18 @@ namespace Ryujinx.Graphics.Metal
+             return true;
+         }
+ 
++        // Rig-only: reject every Nth validated draw so the skip path can be exercised
++        // without waiting for a real alias. Read once per process; launchers never set it.
++        private static readonly long ForcedStopInterval =
++            long.TryParse(Environment.GetEnvironmentVariable("SMASH_COUCH_TEST_FEEDBACK_SKIP_EVERY"), out long every) && every > 0 ? every : 0;
++        private static long _validations;
++
+         internal static void Validate(EncoderState state, ResourceBindingSegment[][] sets, string context)
+         {
+             try
+             {
++                if (ForcedStopInterval > 0 && Interlocked.Increment(ref _validations) % ForcedStopInterval == 0)
++                    Fail(context, "result=ForcedTestStop");
+                 ValidateCore(state, sets, context);
+             }
+             catch (FeedbackGuardException exception)
+@@ -250,8 +259,7 @@ namespace Ryujinx.Graphics.Metal
+         {
+             string message = $"[CouchNativeFeedback] STOP BEFORE DRAW;{context};snapshot-failed=" +
+                 $"{failure.GetType().Name}:{failure.Message};{evidence.Binding.Label}";
+-            Logger.Error?.PrintMsg(LogClass.Gpu, message);
+-            Console.Error.WriteLine(message);
++            Report(message);
+             FeedbackGuardException stop = new(message, evidence);
+             NativeFeedbackDiagnostics.TryCapture(state, sets, context, stop);
+             throw stop;
+@@ -440,9 +448,35 @@ namespace Ryujinx.Graphics.Metal
+         private static void Fail(string context, string detail, FailureEvidence evidence = null)
+         {
+             string message = $"[CouchNativeFeedback] STOP BEFORE DRAW;{context};{detail}";
++            Report(message);
++            throw new FeedbackGuardException(message, evidence);
++        }
++
++        private static long _stops;
++        private static long _skipped;
++
++        // A recurring effect can be rejected every frame. Keep the first stops and
++        // then one in a thousand so the log stays readable and cheap.
++        private static void Report(string message)
++        {
++            FeedbackStats.CountStop(message);
++            long stop = Interlocked.Increment(ref _stops);
++            if (stop > 16 && stop % 1000 != 0) return;
++            message = $"{message};stop={stop}";
+             Logger.Error?.PrintMsg(LogClass.Gpu, message);
+             Console.Error.WriteLine(message);
+-            throw new FeedbackGuardException(message, evidence);
++        }
++
++        internal static void CountSkippedDraw(FeedbackGuardException failure)
++        {
++            FeedbackStats.CountSkip(failure.Message);
++            long skipped = Interlocked.Increment(ref _skipped);
++            if (skipped == 1 || skipped % 1000 == 0)
++            {
++                string message = $"[CouchNativeFeedback] SKIPPED DRAW;skipped={skipped}";
++                Logger.Warning?.PrintMsg(LogClass.Gpu, message);
++                Console.Error.WriteLine(message);
++            }
+         }
+     }
+ }
+diff --git a/source58/src/Ryujinx.Graphics.Metal/SpeculativePipelines.cs b/src/Ryujinx.Graphics.Metal/SpeculativePipelines.cs
+new file mode 100644
+index 0000000..909e13e
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/SpeculativePipelines.cs
+@@ -0,0 +1,449 @@
++using Ryujinx.Common.Logging;
++using Ryujinx.Graphics.GAL;
++using SharpMetal.Metal;
++using System;
++using System.Collections.Concurrent;
++using System.Diagnostics;
++using System.Runtime.Versioning;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Speculative first-draw pipelines for mid-game guest programs.
++    //
++    // A program's first draw builds its PipelineUid from the GAL Set* calls and
++    // creates that pipeline synchronously on the render thread (about 25 ms for
++    // a new variant). The GPU layer passes the requesting draw's pipeline state
++    // to CreateProgram (ShaderInfo.State, the state Vulkan uses for its
++    // background pipeline); converted exactly as EncoderStateManager converts
++    // the matching Set* calls, it predicts that key.
++    //
++    // The compile worker predicts before it publishes the program and then
++    // queues the build on separate builder threads, so a build never delays a
++    // shader compile. The pipeline is built detached from the program's cache.
++    // When the render thread requests exactly the predicted key it takes the
++    // pipeline, waiting only for a build that is already running; a build that
++    // has not started is cancelled and the render thread creates the pipeline
++    // as it would without speculation. Any other key never waits, and a wrong
++    // first-use prediction cancels a build that has not started. A burst of new
++    // programs gets its first pipelines built in parallel instead of one after
++    // another on the render thread. Boot programs are not speculated; their
++    // recorded pipelines come from recipes.
++    //
++    // SMASH_COUCH_SPECULATIVE_PSO: on (default) | shadow (predict and compare
++    // only) | off.
++    [SupportedOSPlatform("macos")]
++    static class SpeculativePipelines
++    {
++        internal enum SpeculationMode { Off, Shadow, On }
++
++        internal static readonly SpeculationMode Mode = ReadMode();
++
++        // Key regions compared at a program's first pipeline request.
++        private enum Field { Header, ColorFormat, Blend, WriteMask, VertexAttribute, VertexLayout, Count }
++
++        private const int MaxDetailLogs = 24;
++        private const int MaxFailureLogs = 8;
++
++        private static readonly int BuilderCount = Math.Clamp(Environment.ProcessorCount / 4, 1, 4);
++        private static readonly BlockingCollection<Action> _builds = new();
++        private static readonly object _startGate = new();
++        private static volatile bool _started;
++
++        private static long _offered, _unpredictable, _built, _failed, _hits, _unused, _preempted, _cancelled;
++        private static long _buildTicks, _maxBuildTicks;
++        private static long _waits, _waitTicks, _maxWaitTicks;
++        private static long _firstUseMatches, _firstUseMismatches;
++        private static readonly long[] _mismatchFields = new long[(int)Field.Count];
++        private static int _detailLogs;
++        private static int _failureLogs;
++        private static string _lastSummary;
++
++        private static SpeculationMode ReadMode()
++        {
++            return Environment.GetEnvironmentVariable("SMASH_COUCH_SPECULATIVE_PSO")?.Trim().ToLowerInvariant() switch
++            {
++                "off" or "0" => SpeculationMode.Off,
++                "shadow" => SpeculationMode.Shadow,
++                _ => SpeculationMode.On,
++            };
++        }
++
++        internal static bool Enabled => Mode != SpeculationMode.Off;
++
++        private static bool IsTriangleTopology(PrimitiveTopology topology)
++        {
++            return topology is PrimitiveTopology.Triangles or PrimitiveTopology.TriangleStrip or
++                PrimitiveTopology.TriangleFan or PrimitiveTopology.Quads or PrimitiveTopology.QuadStrip or
++                PrimitiveTopology.Polygon;
++        }
++
++        // Mirrors EncoderStateManager.UpdateRenderTargetColorMasks.
++        private static MTLColorWriteMask WriteMask(uint componentMask)
++        {
++            MTLColorWriteMask mask = MTLColorWriteMask.None;
++            mask |= (componentMask & (0x1 << 0)) != 0 ? MTLColorWriteMask.Red : 0;
++            mask |= (componentMask & (0x1 << 1)) != 0 ? MTLColorWriteMask.Green : 0;
++            mask |= (componentMask & (0x1 << 2)) != 0 ? MTLColorWriteMask.Blue : 0;
++            mask |= (componentMask & (0x1 << 3)) != 0 ? MTLColorWriteMask.Alpha : 0;
++            return mask;
++        }
++
++        // Worker, before the program is published. Never throws: a failed
++        // prediction is counted and the program is used as without speculation.
++        internal static bool TryPredict(ProgramPipelineState gal, bool usesPerVertexTransport, out PipelineState state)
++        {
++            Interlocked.Increment(ref _offered);
++            try
++            {
++                if (Predict(gal, usesPerVertexTransport, out state))
++                {
++                    return true;
++                }
++            }
++            catch (Exception exception)
++            {
++                state = default;
++                LogFailure("prediction", exception);
++            }
++
++            Interlocked.Increment(ref _unpredictable);
++            return false;
++        }
++
++        // Predicts the render thread's PipelineState for a draw with this GAL state.
++        // Each part mirrors the EncoderStateManager update named beside it, applied to
++        // the state EncoderState starts from (PipelineState.Initialize).
++        private static bool Predict(ProgramPipelineState gal, bool usesPerVertexTransport, out PipelineState state)
++        {
++            state = new PipelineState();
++            state.Initialize();
++
++            // UpdatePipelineForPrimitive: only transport programs carry a class. Their
++            // point and line draws use other program variants or are refused.
++            if (usesPerVertexTransport)
++            {
++                if (!IsTriangleTopology(gal.Topology))
++                {
++                    return false;
++                }
++
++                state.InputPrimitiveTopologyClass = MTLPrimitiveTopologyClass.Triangle;
++            }
++
++            // UpdateRasterizerDiscard, UpdateLogicOpState. Alpha-to-coverage and
++            // alpha-to-one (UpdateMultisampleState) are not in the GAL pipeline
++            // state; they are predicted off.
++            state.RasterizerDiscardEnable = gal.RasterizerDiscard;
++            state.LogicOpEnable = gal.LogicOpEnable;
++            state.LogicOp = gal.LogicOp.Convert();
++
++            // UpdateRenderTargetsInternal: the texture manager always passes all
++            // color slots; formats come from FormatTable like Texture creation.
++            // UpdateRenderTargetColorMasks / UpdateBlendDescriptors: a zero write
++            // mask swaps the blend state out, keeping only the pixel format.
++            state.ColorBlendAttachmentStateCount = Constants.MaxColorAttachments;
++            for (int index = 0; index < Constants.MaxColorAttachments; index++)
++            {
++                ref ColorBlendStateUid blend = ref state.Internal.ColorBlendState[index];
++                MTLColorWriteMask mask = WriteMask(gal.ColorWriteMask[index]);
++                blend = new ColorBlendStateUid();
++                if (mask != MTLColorWriteMask.None)
++                {
++                    BlendDescriptor descriptor = gal.BlendDescriptors[index];
++                    blend.Enable = descriptor.Enable;
++                    blend.AlphaBlendOperation = descriptor.AlphaOp.Convert();
++                    blend.RgbBlendOperation = descriptor.ColorOp.Convert();
++                    blend.SourceAlphaBlendFactor = descriptor.AlphaSrcFactor.Convert();
++                    blend.DestinationAlphaBlendFactor = descriptor.AlphaDstFactor.Convert();
++                    blend.SourceRGBBlendFactor = descriptor.ColorSrcFactor.Convert();
++                    blend.DestinationRGBBlendFactor = descriptor.ColorDstFactor.Convert();
++                }
++
++                blend.WriteMask = mask;
++                blend.PixelFormat = gal.AttachmentEnable[index]
++                    ? FormatTable.GetFormat(gal.AttachmentFormats[index])
++                    : MTLPixelFormat.Invalid;
++            }
++
++            state.DepthStencilFormat = gal.DepthStencilEnable
++                ? FormatTable.GetFormat(gal.DepthStencilFormat)
++                : MTLPixelFormat.Invalid;
++
++            // UpdateVertexAttribs / UpdateVertexBuffers: the GPU layer always sends
++            // all of its attributes; unused renderer slots keep their defaults.
++            // Unmapped or disabled buffers reach the renderer with stride 0.
++            VertexAttribDescriptor[] attribs = new VertexAttribDescriptor[Constants.MaxVertexAttributes];
++            int attribCount = Math.Clamp(gal.VertexAttribCount, 0, attribs.Length);
++            gal.VertexAttribs.AsSpan()[..attribCount].CopyTo(attribs);
++
++            VertexBufferState[] buffers = new VertexBufferState[Constants.MaxVertexBuffers];
++            int bufferCount = Math.Clamp(gal.VertexBufferCount, 0, buffers.Length);
++            for (int index = 0; index < buffers.Length; index++)
++            {
++                BufferPipelineDescriptor vb = index < bufferCount ? gal.VertexBuffers[index] : default;
++                buffers[index] = vb.Enable
++                    ? new VertexBufferState(BufferHandle.Null, 0, 0, vb.Divisor, vb.Stride)
++                    : new VertexBufferState(BufferHandle.Null, 0, 0, 0, 0);
++            }
++
++            EncoderStateManager.ApplyVertexState(ref state, buffers, attribs);
++
++            return true;
++        }
++
++        // Compile worker, after the program is published. False when the builder
++        // threads could not be started; the caller then cancels the build.
++        internal static bool Queue(Action build)
++        {
++            if (!_started)
++            {
++                lock (_startGate)
++                {
++                    if (!_started)
++                    {
++                        try
++                        {
++                            for (int index = 0; index < BuilderCount; index++)
++                            {
++                                new Thread(Work) { Name = $"Metal.SpeculativeBuild.{index}", IsBackground = true }.Start();
++                            }
++                        }
++                        catch (Exception exception)
++                        {
++                            LogFailure("builder start", exception);
++                            return false;
++                        }
++
++                        _started = true;
++                        Logger.Info?.Print(LogClass.Gpu, $"MetalSpeculativePipelines: started {BuilderCount} builder threads");
++                    }
++                }
++            }
++
++            _builds.Add(build);
++            return true;
++        }
++
++        private static void Work()
++        {
++            foreach (Action build in _builds.GetConsumingEnumerable())
++            {
++                try
++                {
++                    build();
++                }
++                catch (Exception exception)
++                {
++                    // Builds complete their own state in a finally; never lose a builder.
++                    LogFailure("builder", exception);
++                }
++            }
++        }
++
++        // Builder thread. Never throws; returns default when creation failed
++        // (counted and logged), and the draw then creates the pipeline normally.
++        internal static MTLRenderPipelineState Build(MTLDevice device, Program program, ref PipelineState state)
++        {
++            long start = Stopwatch.GetTimestamp();
++            try
++            {
++                MTLRenderPipelineState pipeline = state.CreateDetachedRenderPipeline(device, program);
++                Interlocked.Increment(ref _built);
++                return pipeline;
++            }
++            catch (Exception exception)
++            {
++                Interlocked.Increment(ref _failed);
++                LogFailure("build", exception);
++                return default;
++            }
++            finally
++            {
++                long ticks = Stopwatch.GetTimestamp() - start;
++                Interlocked.Add(ref _buildTicks, ticks);
++                UpdateMax(ref _maxBuildTicks, ticks);
++            }
++        }
++
++        // Waits for a running build: from the render thread before it takes the
++        // pipeline (counted), or from Dispose (not counted).
++        internal static void WaitForBuild(Task work, bool counted)
++        {
++            if (work == null || work.IsCompleted)
++            {
++                return;
++            }
++
++            long start = Stopwatch.GetTimestamp();
++            try
++            {
++                work.Wait();
++            }
++            catch (AggregateException exception)
++            {
++                LogFailure("program work", exception.InnerException ?? exception);
++            }
++
++            if (counted)
++            {
++                long ticks = Stopwatch.GetTimestamp() - start;
++                Interlocked.Increment(ref _waits);
++                Interlocked.Add(ref _waitTicks, ticks);
++                UpdateMax(ref _maxWaitTicks, ticks);
++            }
++        }
++
++        private static void UpdateMax(ref long max, long value)
++        {
++            long current;
++            while (value > (current = Interlocked.Read(ref max)) &&
++                   Interlocked.CompareExchange(ref max, value, current) != current)
++            {
++            }
++        }
++
++        private static void LogFailure(string what, Exception exception)
++        {
++            if (Interlocked.Increment(ref _failureLogs) <= MaxFailureLogs)
++            {
++                Logger.Warning?.Print(LogClass.Gpu, $"MetalSpeculativePipelines: {what} failed: {exception.GetType().Name}: {exception.Message}");
++            }
++        }
++
++        internal static void CountHit() => Interlocked.Increment(ref _hits);
++
++        internal static void CountUnused() => Interlocked.Increment(ref _unused);
++
++        internal static void CountPreempted() => Interlocked.Increment(ref _preempted);
++
++        internal static void CountCancelled() => Interlocked.Increment(ref _cancelled);
++
++        // Render thread: the program's first pipeline request against its
++        // prediction. Returns true when they match.
++        internal static bool ObserveFirstUse(ref PipelineUid predicted, ref PipelineUid actual)
++        {
++            if (predicted.Equals(ref actual))
++            {
++                Interlocked.Increment(ref _firstUseMatches);
++                return true;
++            }
++
++            Interlocked.Increment(ref _firstUseMismatches);
++
++            PipelineState p = new() { Internal = predicted };
++            PipelineState a = new() { Internal = actual };
++            bool header = p.Internal.Id0 != a.Internal.Id0 || p.Internal.Id1 != a.Internal.Id1;
++            bool colorFormat = false, blend = false, writeMask = false, attribute = false, layout = false;
++            for (int index = 0; index < Constants.MaxColorAttachments; index++)
++            {
++                ColorBlendStateUid pb = p.Internal.ColorBlendState[index], ab = a.Internal.ColorBlendState[index];
++                colorFormat |= pb.PixelFormat != ab.PixelFormat;
++                writeMask |= pb.WriteMask != ab.WriteMask;
++                blend |= ab.PixelFormat != MTLPixelFormat.Invalid && pb.PixelFormat == ab.PixelFormat &&
++                    (pb.Id0 & ~(0xFUL << 56)) != (ab.Id0 & ~(0xFUL << 56));
++            }
++
++            int attributes = (int)Math.Min(a.VertexAttributeDescriptionsCount, (uint)Constants.MaxVertexAttributes);
++            for (int index = 0; index < attributes; index++)
++            {
++                attribute |= p.Internal.VertexAttributes[index].Id0 != a.Internal.VertexAttributes[index].Id0;
++            }
++
++            int layouts = (int)Math.Min(a.VertexBindingDescriptionsCount, Constants.ZeroBufferIndex + 1);
++            for (int index = 0; index < layouts; index++)
++            {
++                layout |= p.Internal.VertexBindings[index].Id0 != a.Internal.VertexBindings[index].Id0;
++            }
++
++            if (header) Interlocked.Increment(ref _mismatchFields[(int)Field.Header]);
++            if (colorFormat) Interlocked.Increment(ref _mismatchFields[(int)Field.ColorFormat]);
++            if (blend) Interlocked.Increment(ref _mismatchFields[(int)Field.Blend]);
++            if (writeMask) Interlocked.Increment(ref _mismatchFields[(int)Field.WriteMask]);
++            if (attribute) Interlocked.Increment(ref _mismatchFields[(int)Field.VertexAttribute]);
++            if (layout) Interlocked.Increment(ref _mismatchFields[(int)Field.VertexLayout]);
++
++            if (Interlocked.Increment(ref _detailLogs) <= MaxDetailLogs)
++            {
++                Logger.Info?.Print(LogClass.Gpu,
++                    $"MetalSpeculativePipelines: first-use mismatch: " +
++                    $"header={header} [pred id0={p.Internal.Id0:X16} id1={p.Internal.Id1:X16} actual id0={a.Internal.Id0:X16} id1={a.Internal.Id1:X16}] " +
++                    $"colorFormat={colorFormat} blend={blend} writeMask={writeMask} " +
++                    $"attr={attribute} layout={layout} " +
++                    $"pred[{Describe(ref p)}] actual[{Describe(ref a)}]");
++            }
++
++            return false;
++        }
++
++        private static string Describe(ref PipelineState s)
++        {
++            System.Text.StringBuilder text = new();
++            text.Append($"cls={s.InputPrimitiveTopologyClass} ds={s.DepthStencilFormat} a2c={s.AlphaToCoverageEnable} logic={s.LogicOpEnable}/{s.LogicOp} discard={s.RasterizerDiscardEnable} rts={s.ColorBlendAttachmentStateCount}");
++            for (int index = 0; index < Constants.MaxColorAttachments; index++)
++            {
++                ColorBlendStateUid blend = s.Internal.ColorBlendState[index];
++                if (blend.Id0 != 0)
++                {
++                    text.Append($" c{index}={blend.Id0:X16}");
++                }
++            }
++
++            int attributes = (int)Math.Min(s.VertexAttributeDescriptionsCount, (uint)Constants.MaxVertexAttributes);
++            for (int index = 0; index < attributes; index++)
++            {
++                text.Append($" a{index}={s.Internal.VertexAttributes[index].Id0:X}");
++            }
++
++            int layouts = (int)Math.Min(s.VertexBindingDescriptionsCount, 33u);
++            for (int index = 0; index < layouts; index++)
++            {
++                ulong id = s.Internal.VertexBindings[index].Id0;
++                if (id != 0)
++                {
++                    text.Append($" l{index}={id:X}");
++                }
++            }
++
++            return text.ToString();
++        }
++
++        internal static string Summary()
++        {
++            double ms = 1000.0 / Stopwatch.Frequency;
++            return $"MetalSpeculativePipelines: mode={Mode};offered={Interlocked.Read(ref _offered)};" +
++                $"unpredictable={Interlocked.Read(ref _unpredictable)};built={Interlocked.Read(ref _built)};" +
++                $"failed={Interlocked.Read(ref _failed)};hits={Interlocked.Read(ref _hits)};unused={Interlocked.Read(ref _unused)};" +
++                $"preempted={Interlocked.Read(ref _preempted)};cancelled={Interlocked.Read(ref _cancelled)};" +
++                $"buildMs={Interlocked.Read(ref _buildTicks) * ms:F1};maxBuildMs={Interlocked.Read(ref _maxBuildTicks) * ms:F1};" +
++                $"waits={Interlocked.Read(ref _waits)};waitMs={Interlocked.Read(ref _waitTicks) * ms:F1};" +
++                $"maxWaitMs={Interlocked.Read(ref _maxWaitTicks) * ms:F1};" +
++                $"firstUseMatches={Interlocked.Read(ref _firstUseMatches)};" +
++                $"firstUseMismatches={Interlocked.Read(ref _firstUseMismatches)};" +
++                $"mismatchHeader={Interlocked.Read(ref _mismatchFields[(int)Field.Header])};" +
++                $"mismatchColorFormat={Interlocked.Read(ref _mismatchFields[(int)Field.ColorFormat])};" +
++                $"mismatchBlend={Interlocked.Read(ref _mismatchFields[(int)Field.Blend])};" +
++                $"mismatchWriteMask={Interlocked.Read(ref _mismatchFields[(int)Field.WriteMask])};" +
++                $"mismatchVertexAttribute={Interlocked.Read(ref _mismatchFields[(int)Field.VertexAttribute])};" +
++                $"mismatchVertexLayout={Interlocked.Read(ref _mismatchFields[(int)Field.VertexLayout])}";
++        }
++
++        internal static void LogSummaryIfChanged(string reason)
++        {
++            if (!Enabled)
++            {
++                return;
++            }
++
++            string summary = Summary();
++            if (summary == _lastSummary)
++            {
++                return;
++            }
++
++            _lastSummary = summary;
++            Logger.Info?.Print(LogClass.Gpu, summary + ";reason=" + reason);
++        }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Metal/State/PipelineState.cs b/src/Ryujinx.Graphics.Metal/State/PipelineState.cs
+index 793cc9d..1120277 100644
+--- a/src/Ryujinx.Graphics.Metal/State/PipelineState.cs
++++ b/src/Ryujinx.Graphics.Metal/State/PipelineState.cs
+@@ -257,6 +257,33 @@ namespace Ryujinx.Graphics.Metal
+             return pipelineState;
+         }
+ 
++        // Worker-side creation of a predicted first-draw pipeline after its
++        // program was published (Program.BuildSpeculativePipeline): the same
++        // descriptor path as CreateRenderPipeline, but detached from the
++        // program's pipeline cache, which the render thread may already be
++        // using, and not timed as a render-thread RenderPipeline scope.
++        internal MTLRenderPipelineState CreateDetachedRenderPipeline(MTLDevice device, Program program)
++        {
++            if (program.UsesPerVertexTransport && InputPrimitiveTopologyClass !=
++                (program.UsesPointTransport ? MTLPrimitiveTopologyClass.Point : MTLPrimitiveTopologyClass.Triangle))
++            {
++                throw new InvalidOperationException("Metal shader transport variant does not match the actual primitive class.");
++            }
++
++            using MTLRenderPipelineDescriptor descriptor = new();
++            PopulateRenderDescriptor(descriptor, program);
++
++            NSError error = new(IntPtr.Zero);
++            MTLRenderPipelineState pipelineState = device.NewRenderPipelineState(descriptor, ref error);
++            if (pipelineState.NativePtr == IntPtr.Zero)
++            {
++                string detail = error != IntPtr.Zero ? StringHelper.String(error.LocalizedDescription) : "No Metal error returned";
++                throw new InvalidOperationException($"Failed to create Metal render pipeline (class={InputPrimitiveTopologyClass}): {detail}");
++            }
++
++            return pipelineState;
++        }
++
+         public static MTLComputePipelineDescriptor CreateComputeDescriptor(Program program)
+         {
+             ComputeSize localSize = program.ComputeLocalSize;
+diff --git a/source58/src/Ryujinx.Graphics.Metal/TransportSourceArchive.cs b/src/Ryujinx.Graphics.Metal/TransportSourceArchive.cs
+new file mode 100644
+index 0000000..c155002
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/TransportSourceArchive.cs
+@@ -0,0 +1,132 @@
++using Ryujinx.Graphics.GAL;
++using System;
++using System.Buffers;
++using System.IO;
++using System.IO.Compression;
++using System.Text;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // The original sources of a per-vertex transport program, kept so a point
++    // variant can be built if the program is ever drawn with points
++    // (Program.ResolveForPrimitive). Nearly every program uses transport and
++    // point variants are rare (4 in a 40-minute tour), but as UTF-16 strings
++    // the sources average roughly 190 KB per program: about 3 GB of the
++    // launcher's 4 GiB managed heap with a 16k-program cache, and rig tour6
++    // ended in an OutOfMemoryException. Once the program has compiled,
++    // Compact() keeps each source as deflated UTF-8 (about 8x smaller) and
++    // Expand() rebuilds identical sources. Encoding is strict, so a source
++    // that could not round-trip exactly is kept as it was.
++    sealed class TransportSourceArchive
++    {
++        private static readonly UTF8Encoding _strictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
++
++        private readonly object _gate = new();
++        // Everything but the code: stage, language, binary and varying facts.
++        private readonly ShaderSource[] _shells;
++        // Per stage, exactly one of these holds the code (or neither, when the
++        // stage had none).
++        private readonly string[] _code;
++        private readonly byte[][] _packed;
++
++        internal TransportSourceArchive(ShaderSource[] sources)
++        {
++            _shells = new ShaderSource[sources.Length];
++            _code = new string[sources.Length];
++            _packed = new byte[sources.Length][];
++            for (int index = 0; index < sources.Length; index++)
++            {
++                ShaderSource source = sources[index];
++                _shells[index] = new ShaderSource(null, source.BinaryCode, source.Stage, source.Language, source.NumericVaryings);
++                _code[index] = source.Code;
++            }
++        }
++
++        // Runs once, on the compile worker after the program is published, so
++        // it adds nothing to a render-thread wait. Concurrent Expand() calls
++        // see either form; both decode to the same text.
++        internal void Compact()
++        {
++            for (int index = 0; index < _code.Length; index++)
++            {
++                string code;
++                lock (_gate)
++                {
++                    code = _code[index];
++                }
++                if (code == null)
++                {
++                    continue;
++                }
++
++                byte[] packed;
++                try
++                {
++                    packed = Pack(code);
++                }
++                catch (Exception)
++                {
++                    // Not exactly representable (or out of memory): keep the string.
++                    continue;
++                }
++
++                lock (_gate)
++                {
++                    _packed[index] = packed;
++                    _code[index] = null;
++                }
++            }
++        }
++
++        internal ShaderSource[] Expand()
++        {
++            ShaderSource[] sources = new ShaderSource[_shells.Length];
++            for (int index = 0; index < sources.Length; index++)
++            {
++                string code;
++                byte[] packed;
++                lock (_gate)
++                {
++                    code = _code[index];
++                    packed = _packed[index];
++                }
++                if (code == null && packed != null)
++                {
++                    code = Unpack(packed);
++                }
++                ShaderSource shell = _shells[index];
++                sources[index] = new ShaderSource(code, shell.BinaryCode, shell.Stage, shell.Language, shell.NumericVaryings);
++            }
++            return sources;
++        }
++
++        private static byte[] Pack(string code)
++        {
++            // Pooled scratch: one large array per source would be large-object
++            // garbage for every program at boot.
++            byte[] utf8 = ArrayPool<byte>.Shared.Rent(_strictUtf8.GetMaxByteCount(code.Length));
++            try
++            {
++                int length = _strictUtf8.GetBytes(code, 0, code.Length, utf8, 0);
++                using MemoryStream output = new(length / 4 + 256);
++                using (DeflateStream deflate = new(output, CompressionLevel.Fastest, leaveOpen: true))
++                {
++                    deflate.Write(utf8, 0, length);
++                }
++                return output.ToArray();
++            }
++            finally
++            {
++                ArrayPool<byte>.Shared.Return(utf8);
++            }
++        }
++
++        private static string Unpack(byte[] packed)
++        {
++            using DeflateStream deflate = new(new MemoryStream(packed, writable: false), CompressionMode.Decompress);
++            using MemoryStream utf8 = new();
++            deflate.CopyTo(utf8);
++            return _strictUtf8.GetString(utf8.GetBuffer(), 0, (int)utf8.Length);
++        }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Metal/Window.cs b/src/Ryujinx.Graphics.Metal/Window.cs
+index ba99a73..8b03a13 100644
+--- a/src/Ryujinx.Graphics.Metal/Window.cs
++++ b/src/Ryujinx.Graphics.Metal/Window.cs
+@@ -31,6 +31,8 @@ namespace Ryujinx.Graphics.Metal
+         private IPostProcessingEffect _effect;
+         private IScalingFilter _scalingFilter;
+         private bool _isLinear;
++        private long _nilDrawables;
++        private long _nilStreak;
+ 
+         public bool IsVSyncEnabled => _metalLayer.DisplaySyncEnabled;
+         
+@@ -75,6 +77,7 @@ namespace Ryujinx.Graphics.Metal
+             using NSAutoreleasePool pool = new();
+             if (_renderer.Pipeline is Pipeline pipeline && texture is Texture tex)
+             {
++                FrameSnapshot.TryCapture(tex);
+                 ResizeIfNeeded();
+ 
+                 CAMetalDrawable drawable;
+@@ -83,6 +86,31 @@ namespace Ryujinx.Graphics.Metal
+                     drawable = new(ObjectiveC.IntPtr_objc_msgSend(_metalLayer, "nextDrawable"));
+                 }
+ 
++                // nextDrawable returns nil on timeout, an invalid layer state or
++                // memory pressure. Skip only this presentation: commit the frame's
++                // work, rebase the present schedule and keep the previous image.
++                if (drawable.NativePtr == IntPtr.Zero)
++                {
++                    long misses = ++_nilDrawables;
++                    long streak = ++_nilStreak;
++                    if (misses <= 8 || misses % 1000 == 0)
++                    {
++                        Logger.Warning?.PrintMsg(LogClass.Gpu, $"[CouchNativePresent] nextDrawable returned nil;count={misses};streak={streak}");
++                    }
++                    if (streak == 120)
++                    {
++                        Logger.Error?.PrintMsg(LogClass.Gpu, $"[CouchNativePresent] no drawable for {streak} consecutive presents;count={misses}");
++                    }
++                    PresentPacing.Reset();
++                    pipeline.FlushCommandsImpl();
++                    return;
++                }
++                if (_nilStreak != 0)
++                {
++                    Logger.Warning?.PrintMsg(LogClass.Gpu, $"[CouchNativePresent] drawable recovered after {_nilStreak} nil presents;count={_nilDrawables}");
++                    _nilStreak = 0;
++                }
++
+                 long drawableAcquired = backendBegin != 0 ? Stopwatch.GetTimestamp() : 0;
+                 _width = (int)drawable.Texture.Width;
+                 _height = (int)drawable.Texture.Height;
+@@ -165,6 +193,8 @@ namespace Ryujinx.Graphics.Metal
+         public void ChangeVSyncMode(VSyncMode vSyncMode)
+         {
+             _metalLayer.DisplaySyncEnabled = vSyncMode is VSyncMode.Switch;
++            PresentPacing.VSyncSwitch = vSyncMode is VSyncMode.Switch;
++            PresentPacing.Reset();
+         }
+ 
+         public void SetAntiAliasing(AntiAliasing effect)
+diff --git a/source58/src/Ryujinx.HLE/HOS/Kernel/Process/HostUnmappedAccessProbe.cs b/src/Ryujinx.HLE/HOS/Kernel/Process/HostUnmappedAccessProbe.cs
+new file mode 100644
+index 0000000..4ecae12
+--- /dev/null
++++ b/src/Ryujinx.HLE/HOS/Kernel/Process/HostUnmappedAccessProbe.cs
+@@ -0,0 +1,110 @@
++using Ryujinx.Common.Logging;
++using Ryujinx.HLE.HOS.Kernel.Memory;
++using Ryujinx.Memory;
++using System;
++using System.Threading;
++
++namespace Ryujinx.HLE.HOS.Kernel.Process
++{
++    /// <summary>
++    /// Rig-only check (SMASH_COUCH_PROBE_HOST_UNMAPPED=1) of how host-thread accesses to unmapped guest memory finish
++    /// (KProcess.InvalidAccessHandler, then HvMemoryManager reading or writing page by page). Thirty seconds after the
++    /// application starts, a host thread reads across both edges of the first code mapping and outside the address
++    /// space, writes to the page below the process address space (which the kernel never maps), and logs the outcome.
++    /// </summary>
++    static class HostUnmappedAccessProbe
++    {
++        private const ulong PageSize = KPageTableBase.PageSize;
++
++        private static int _started;
++
++        public static void StartIfRequested(KProcess process)
++        {
++            if (Environment.GetEnvironmentVariable("SMASH_COUCH_PROBE_HOST_UNMAPPED") != "1" || Interlocked.Exchange(ref _started, 1) != 0)
++            {
++                return;
++            }
++
++            new Thread(() => Run(process)) { Name = "HostUnmappedAccessProbe", IsBackground = true }.Start();
++        }
++
++        private static void Run(KProcess process)
++        {
++            Thread.Sleep(TimeSpan.FromSeconds(30));
++
++            if (process.State is ProcessState.Crashed or ProcessState.Exiting or ProcessState.Exited)
++            {
++                return;
++            }
++
++            try
++            {
++                IVirtualMemoryManager memory = process.CpuMemory;
++                KPageTableBase table = process.MemoryManager;
++
++                ulong first = FindEdge(memory, table.CodeRegionStart, table.CodeRegionEnd, rising: true);
++                ulong last = first == 0 ? 0 : FindEdge(memory, first, table.CodeRegionEnd, rising: false);
++
++                string rising = "no-edge", falling = "no-edge", writes = "n/a";
++
++                if (first != 0)
++                {
++                    byte[] page = memory.GetSpan(first, (int)PageSize).ToArray();
++                    ReadOnlySpan<byte> read = memory.GetSpan(first - PageSize, (int)(2 * PageSize));
++
++                    rising = IsZero(read[..(int)PageSize]) && read[(int)PageSize..].SequenceEqual(page) ? "ok" : "MISMATCH";
++                }
++
++                // Writes go below the process address space, which the kernel never maps, so they cannot reach game
++                // memory. Both must be dropped without an exception.
++                ulong never = table.AddrSpaceStart - PageSize;
++
++                if (table.AddrSpaceStart >= PageSize && !memory.IsMapped(never))
++                {
++                    memory.Write(never, new byte[16]);
++                    ((IWritableBlock)memory).WriteUntracked(never, new byte[16]);
++
++                    writes = memory.IsMapped(never) ? "MAPPED" : "ok";
++                }
++
++                if (last != 0)
++                {
++                    byte[] page = memory.GetSpan(last, (int)PageSize).ToArray();
++                    ReadOnlySpan<byte> read = memory.GetSpan(last, (int)(2 * PageSize));
++
++                    falling = read[..(int)PageSize].SequenceEqual(page) && IsZero(read[(int)PageSize..]) ? "ok" : "MISMATCH";
++                }
++
++                string outside = IsZero(memory.GetSpan(1UL << 48, (int)PageSize)) ? "ok" : "MISMATCH";
++
++                Logger.Info?.Print(LogClass.Cpu, $"HostUnmappedAccessProbe: rising={rising} falling={falling} outside={outside} writes={writes} first=0x{first:X} last=0x{last:X} written=0x{never:X}");
++            }
++            catch (Exception e)
++            {
++                Logger.Error?.Print(LogClass.Cpu, $"HostUnmappedAccessProbe: FAILED {e.GetType().Name}: {e.Message}");
++            }
++        }
++
++        /// <summary>
++        /// Rising: the first mapped page whose previous page is unmapped. Falling: the first mapped page whose next page
++        /// is unmapped. Returns 0 when the region has none.
++        /// </summary>
++        private static ulong FindEdge(IVirtualMemoryManager memory, ulong start, ulong end, bool rising)
++        {
++            for (ulong va = start & ~(PageSize - 1); va < end; va += PageSize)
++            {
++                if (memory.IsMapped(va) && !memory.IsMapped(rising ? va - PageSize : va + PageSize))
++                {
++                    return va;
++                }
++            }
++
++            return 0;
++        }
++
++        private static bool IsZero(ReadOnlySpan<byte> data)
++        {
++            return data.IndexOfAnyExcept((byte)0) < 0;
++        }
++    }
++}
+diff --git a/src/Ryujinx.HLE/HOS/Kernel/Process/KProcess.cs b/src/Ryujinx.HLE/HOS/Kernel/Process/KProcess.cs
+index 32dca15..a7e0ac9 100644
+--- a/src/Ryujinx.HLE/HOS/Kernel/Process/KProcess.cs
++++ b/src/Ryujinx.HLE/HOS/Kernel/Process/KProcess.cs
+@@ -692,6 +692,11 @@ namespace Ryujinx.HLE.HOS.Kernel.Process
+                 if (result == Result.Success)
+                 {
+                     mainThread.IncrementReferenceCount();
++
++                    if (IsApplication)
++                    {
++                        HostUnmappedAccessProbe.StartIfRequested(this);
++                    }
+                 }
+ 
+                 mainThread.DecrementReferenceCount();
+@@ -1066,10 +1071,31 @@ namespace Ryujinx.HLE.HOS.Kernel.Process
+             MemoryManager = new KPageTable(KernelContext, CpuMemory, Context.AddressSpaceSize);
+         }
+ 
++        private static long _ignoredHostAccesses;
++
+         private bool InvalidAccessHandler(ulong va)
+         {
+-            KernelStatic.GetCurrentThread()?.PrintGuestStackTrace();
+-            KernelStatic.GetCurrentThread()?.PrintGuestRegisterPrintout();
++            KThread currentThread = KernelStatic.GetCurrentThread();
++
++            if (currentThread == null)
++            {
++                // A host thread (GPU command processing, audio, video decoding) reached memory the guest has already
++                // unmapped, e.g. a queued draw whose vertex buffer was freed at a scene change. Throwing would end the
++                // whole session, as nothing on those threads handles it. Returning true lets the memory manager finish
++                // the access instead: HvMemoryManager redoes it page by page, unmapped pages reading as zeros and writes
++                // to them dropped (the JIT memory managers stop at the first unmapped page).
++                long count = Interlocked.Increment(ref _ignoredHostAccesses);
++
++                if (count <= 8 || count % 1024 == 0)
++                {
++                    Logger.Warning?.Print(LogClass.Cpu, $"Host access to unmapped memory at virtual address 0x{va:X16} ignored ({count} so far).");
++                }
++
++                return true;
++            }
++
++            currentThread.PrintGuestStackTrace();
++            currentThread.PrintGuestRegisterPrintout();
+ 
+             Logger.Error?.Print(LogClass.Cpu, $"Invalid memory access at virtual address 0x{va:X16}.");
+ 
+diff --git a/src/Ryujinx.Input.SDL2/CouchBridge.cs b/src/Ryujinx.Input.SDL2/CouchBridge.cs
+index dd9110e..7cea991 100644
+--- a/src/Ryujinx.Input.SDL2/CouchBridge.cs
++++ b/src/Ryujinx.Input.SDL2/CouchBridge.cs
+@@ -4,6 +4,7 @@ using System.IO;
+ using System.Net.Sockets;
+ using System.Runtime.InteropServices;
+ using System.Threading;
++using Ryujinx.Common.Logging;
+ using Ryujinx.HLE.HOS.Services.Hid;
+ 
+ namespace Ryujinx.Input.SDL2;
+@@ -53,6 +54,35 @@ internal sealed class CouchReceiver : IDisposable
+     private volatile bool _stopping;
+     private readonly string _path;
+ 
++    // Ordered transition queue (per slot) between the receiver and the HID
++    // update. The launcher sends full state every 4 ms and the host normally
++    // reads every ~1 ms, so the queue holds at most the latest state and adds
++    // nothing. When several datagrams arrive between two reads (a stalled host
++    // loop), each distinct button/trigger/stick-zone state is delivered in
++    // order, one read apart, instead of only the newest surviving. Same-key
++    // updates coalesce into the tail (fresh axes); a full queue overwrites its
++    // tail, so the earliest transitions and the final state are always kept.
++    // Staleness and disconnect neutralization are unchanged.
++    // SMASH_COUCH_INPUT_QUEUE=0 restores latest-wins (counters still run).
++    internal const int TransitionQueueCapacity = 8;
++    private const int SlotBytes = 32;
++    private readonly bool _transitionQueue;
++    private readonly byte[] _queueStates = new byte[8 * TransitionQueueCapacity * SlotBytes];
++    private readonly ulong[] _queueSequences = new ulong[8 * TransitionQueueCapacity];
++    private readonly ulong[] _queueCaptures = new ulong[8 * TransitionQueueCapacity];
++    private readonly ulong[] _queueAccepted = new ulong[8 * TransitionQueueCapacity];
++    private readonly int[] _queueHead = new int[8];
++    private readonly int[] _queueCount = new int[8];
++    private readonly ulong[] _deliveredKey = new ulong[8];
++    // Per-slot trigger press threshold of the consumer (CouchGamepad), so a
++    // release and re-press across it are never coalesced into one state.
++    private readonly float[] _triggerThresholds = [.5f, .5f, .5f, .5f, .5f, .5f, .5f, .5f];
++    private readonly int[] _acceptedSinceRead = new int[8];
++    private long _accepted, _rejectedFormat, _rejectedStale, _rejectedInvalid, _rejectedOrder, _rejectedStopped;
++    private long _supersededPackets, _collapsedTransitions, _heldTransitions, _queueOverflows, _staleQueueDrops;
++    private Timer _summaryTimer;
++    private long _loggedEvents = -1;
++
+     internal bool CapturesFreshnessTrace => _captureFreshnessTrace;
+ 
+     public CouchReceiver(string path, string token)
+@@ -81,6 +111,7 @@ internal sealed class CouchReceiver : IDisposable
+         // Install the shared bridge latch before the receiver thread can accept.
+         _diagnosticStopRequested = diagnosticStopRequested;
+         _sessionGeneration = captureFreshnessTrace ? unchecked((ulong)Interlocked.Increment(ref _nextSessionGeneration)) : 0;
++        _transitionQueue = Environment.GetEnvironmentVariable("SMASH_COUCH_INPUT_QUEUE") != "0";
+         _path = path;
+         // Never delete an existing endpoint: fail closed on collisions.
+         _socket = new Socket(AddressFamily.Unix, SocketType.Dgram, ProtocolType.Unspecified);
+@@ -88,6 +119,7 @@ internal sealed class CouchReceiver : IDisposable
+         File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+         _thread = new Thread(Receive) { IsBackground = true, Name = "Couch input receiver" };
+         _thread.Start();
++        _summaryTimer = new Timer(_ => LogSummaryIfChanged("periodic"), null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+     }
+ 
+     private static (ulong Numer, ulong Denom) ReadDarwinTimebase()
+@@ -135,34 +167,59 @@ internal sealed class CouchReceiver : IDisposable
+     {
+         if (packet.Length != PacketBytes ||
+             BinaryPrimitives.ReadUInt64LittleEndian(packet) != PacketMagicV2 ||
+-            !packet.Slice(8, 16).SequenceEqual(_token)) return false;
++            !packet.Slice(8, 16).SequenceEqual(_token))
++        {
++            Interlocked.Increment(ref _rejectedFormat);
++            return false;
++        }
+ 
+         ulong seq = BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(24));
+         ulong captureTime = BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(32));
+         // Validate at arrival so an old queued datagram cannot enter the latest
+         // snapshot. Read() repeats this check against the original timestamp.
+-        if (!IsFresh(captureTime, _nowTicks())) return false;
++        if (!IsFresh(captureTime, _nowTicks()))
++        {
++            Interlocked.Increment(ref _rejectedStale);
++            return false;
++        }
+ 
+         for (int i = 0; i < 8; i++)
+         {
+             int at = PacketHeaderBytes + i * 32;
+-            if (BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(at)) > 1) return false;
+-            if ((BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(at + 4)) & ~0x1fffeU) != 0) return false;
+-            for (int j = 0; j < 6; j++)
++            bool valid = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(at)) <= 1 &&
++                (BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(at + 4)) & ~0x1fffeU) == 0;
++            for (int j = 0; valid && j < 6; j++)
+             {
+                 float value = BinaryPrimitives.ReadSingleLittleEndian(packet.Slice(at + 8 + j * 4));
+-                if (!float.IsFinite(value) || Math.Abs(value) > 1 || (j >= 4 && value < 0)) return false;
++                valid = float.IsFinite(value) && Math.Abs(value) <= 1 && (j < 4 || value >= 0);
++            }
++            if (!valid)
++            {
++                Interlocked.Increment(ref _rejectedInvalid);
++                return false;
+             }
+         }
+ 
+         lock (_gate)
+         {
+-            if (_diagnosticCloseStopped || (_diagnosticStopRequested?.Invoke() ?? false)) return false;
++            if (_diagnosticCloseStopped || (_diagnosticStopRequested?.Invoke() ?? false))
++            {
++                _rejectedStopped++;
++                return false;
++            }
+             // Recheck immediately before sequence/copy so acceptance
+             // linearizes only while the sender origin is still fresh.
+             ulong acceptedMachTicks = _nowTicks();
+-            if (!IsFresh(captureTime, acceptedMachTicks)) return false;
+-            if (_hasPacket && seq <= _sequence) return false;
++            if (!IsFresh(captureTime, acceptedMachTicks))
++            {
++                _rejectedStale++;
++                return false;
++            }
++            if (_hasPacket && seq <= _sequence)
++            {
++                _rejectedOrder++;
++                return false;
++            }
+             packet.CopyTo(_latest);
+             _sequence = seq;
+             _captureTime = captureTime;
+@@ -171,10 +228,82 @@ internal sealed class CouchReceiver : IDisposable
+                 _acceptedMachTicks = acceptedMachTicks;
+             }
+             _hasPacket = true;
++            _accepted++;
++            for (int slot = 0; slot < 8; slot++)
++            {
++                _acceptedSinceRead[slot]++;
++                EnqueueTransition(slot, packet.Slice(PacketHeaderBytes + slot * SlotBytes, SlotBytes), seq, captureTime, acceptedMachTicks);
++            }
+         }
+         return true;
+     }
+ 
++    internal void SetTriggerThreshold(int slot, float threshold)
++    {
++        if (slot < 0 || slot >= 8) return;
++        lock (_gate)
++        {
++            _triggerThresholds[slot] = threshold;
++        }
++    }
++
++    // Distinct-state key: enable, buttons, trigger press (at the consumer's
++    // threshold) and stick zones. Axis motion inside a zone only refreshes the
++    // queued tail. Called under _gate.
++    private ulong TransitionKey(int slot, ReadOnlySpan<byte> state)
++    {
++        static ulong Zone(float value) => value < -0.5f ? 1UL : value > 0.5f ? 2UL : 0UL;
++        float threshold = _triggerThresholds[slot];
++        ulong key = BinaryPrimitives.ReadUInt32LittleEndian(state.Slice(4));
++        key |= (ulong)(BinaryPrimitives.ReadUInt32LittleEndian(state) & 1) << 32;
++        key |= (F(state, 24) > threshold ? 1UL : 0UL) << 33;
++        key |= (F(state, 28) > threshold ? 1UL : 0UL) << 34;
++        key |= Zone(F(state, 8)) << 35 | Zone(F(state, 12)) << 37 | Zone(F(state, 16)) << 39 | Zone(F(state, 20)) << 41;
++        return key;
++    }
++
++    private Span<byte> QueueEntry(int slot, int index) =>
++        _queueStates.AsSpan((slot * TransitionQueueCapacity + index) * SlotBytes, SlotBytes);
++
++    private void EnqueueTransition(int slot, ReadOnlySpan<byte> state, ulong seq, ulong capture, ulong accepted)
++    {
++        int count = _queueCount[slot];
++        int tail = (_queueHead[slot] + count - 1) % TransitionQueueCapacity;
++        ulong key = TransitionKey(slot, state);
++        ulong previous = count > 0 ? TransitionKey(slot, QueueEntry(slot, tail)) : _deliveredKey[slot];
++        int index;
++        if (count > 0 && key == previous)
++        {
++            index = tail; // Same state: refresh axes and provenance in place.
++        }
++        else if (count == 0 && key == previous)
++        {
++            return; // Nothing new since the last delivery; reads use the latest packet.
++        }
++        else if (count == TransitionQueueCapacity)
++        {
++            index = tail;
++            _queueOverflows++;
++        }
++        else
++        {
++            index = (_queueHead[slot] + count) % TransitionQueueCapacity;
++            _queueCount[slot] = count + 1;
++        }
++        state.CopyTo(QueueEntry(slot, index));
++        int at = slot * TransitionQueueCapacity + index;
++        _queueSequences[at] = seq;
++        _queueCaptures[at] = capture;
++        _queueAccepted[at] = accepted;
++    }
++
++    private void ClearTransitions(int slot)
++    {
++        _queueHead[slot] = 0;
++        _queueCount[slot] = 0;
++        _acceptedSinceRead[slot] = 0;
++    }
++
+     internal (uint Buttons, float LX, float LY, float RX, float RY, float LT, float RT) Read(int slot)
+     {
+         CouchSlotRead snapshot = ReadSnapshot(slot, false);
+@@ -204,29 +333,137 @@ internal sealed class CouchReceiver : IDisposable
+                     0));
+             }
+ 
+-            ulong readMachTicks = _nowTicks();
+-            NpadInputFreshnessReadStatus status = NpadInputFreshnessReadStatus.FreshEnabled;
++            return ReadLatestLocked(slot, trace, _nowTicks());
++        }
++    }
++
++    // Latest-state read under _gate with a single clock sample taken by the caller.
++    private CouchSlotRead ReadLatestLocked(int slot, bool trace, ulong readMachTicks)
++    {
++        NpadInputFreshnessReadStatus status = NpadInputFreshnessReadStatus.FreshEnabled;
++
++        // A dead/stalled launcher cannot leave buttons or sticks held. Age
++        // is measured from the sender's capture timestamp, never arrival.
++        if (!IsFresh(_captureTime, readMachTicks))
++        {
++            status = NpadInputFreshnessReadStatus.Stale;
++            return new CouchSlotRead(default, trace ? CreateProvenance(status, slot, true, _sequence, _captureTime, _acceptedMachTicks, readMachTicks, 0) : default);
++        }
++
++        ReadOnlySpan<byte> s = _latest.AsSpan(PacketHeaderBytes + slot * 32, 32);
++        if (BinaryPrimitives.ReadUInt32LittleEndian(s) == 0)
++        {
++            status = NpadInputFreshnessReadStatus.SlotDisabled;
++            return new CouchSlotRead(default, trace ? CreateProvenance(status, slot, true, _sequence, _captureTime, _acceptedMachTicks, readMachTicks, 0) : default);
++        }
++
++        var state = (BinaryPrimitives.ReadUInt32LittleEndian(s.Slice(4)), F(s, 8), F(s, 12), F(s, 16), F(s, 20), F(s, 24), F(s, 28));
++        NpadInputFreshnessProvenance provenance = trace
++            ? CreateProvenance(status, slot, true, _sequence, _captureTime, _acceptedMachTicks, readMachTicks, 0)
++            : default;
++        return new CouchSlotRead(state, provenance);
++    }
++
++    // Consuming read used once per HID update (CouchGamepad.GetMappedStateSnapshot).
++    // Delivers the oldest queued transition; ReadSnapshot stays a latest-state peek.
++    internal CouchSlotRead ReadNextSnapshot(int slot, bool includeFreshnessTrace)
++    {
++        if (slot < 0 || slot >= 8) return default;
+ 
+-            // A dead/stalled launcher cannot leave buttons or sticks held. Age
+-            // is measured from the sender's capture timestamp, never arrival.
++        bool trace = includeFreshnessTrace && _captureFreshnessTrace;
++        lock (_gate)
++        {
++            if (!_hasPacket || (_diagnosticStopRequested?.Invoke() ?? false))
++            {
++                ClearTransitions(slot);
++                _deliveredKey[slot] = 0;
++                return ReadSnapshot(slot, includeFreshnessTrace);
++            }
++            ulong readMachTicks = _nowTicks();
+             if (!IsFresh(_captureTime, readMachTicks))
+             {
+-                status = NpadInputFreshnessReadStatus.Stale;
+-                return new CouchSlotRead(default, trace ? CreateProvenance(status, slot, true, _sequence, _captureTime, _acceptedMachTicks, readMachTicks, 0) : default);
++                ClearTransitions(slot);
++                _deliveredKey[slot] = 0;
++                return ReadLatestLocked(slot, trace, readMachTicks);
+             }
+ 
+-            ReadOnlySpan<byte> s = _latest.AsSpan(PacketHeaderBytes + slot * 32, 32);
+-            if (BinaryPrimitives.ReadUInt32LittleEndian(s) == 0)
++            int superseded = _acceptedSinceRead[slot] - 1;
++            if (superseded > 0) _supersededPackets += superseded;
++            _acceptedSinceRead[slot] = 0;
++
++            while (_queueCount[slot] > 0 && !IsFresh(_queueCaptures[slot * TransitionQueueCapacity + _queueHead[slot]], readMachTicks))
++            {
++                _queueHead[slot] = (_queueHead[slot] + 1) % TransitionQueueCapacity;
++                _queueCount[slot]--;
++                _staleQueueDrops++;
++            }
++
++            int count = _queueCount[slot];
++            if (count > 1)
+             {
+-                status = NpadInputFreshnessReadStatus.SlotDisabled;
+-                return new CouchSlotRead(default, trace ? CreateProvenance(status, slot, true, _sequence, _captureTime, _acceptedMachTicks, readMachTicks, 0) : default);
++                // Distinct states that latest-wins would never have delivered:
++                // with the queue each is delivered once with newer ones behind
++                // it (held); without it they are collapsed into the latest.
++                if (_transitionQueue) _heldTransitions++;
++                else _collapsedTransitions += count - 1;
+             }
+ 
++            if (!_transitionQueue || count == 0)
++            {
++                ClearTransitions(slot);
++                CouchSlotRead latest = ReadLatestLocked(slot, trace, readMachTicks);
++                _deliveredKey[slot] = TransitionKey(slot, _latest.AsSpan(PacketHeaderBytes + slot * SlotBytes, SlotBytes));
++                return latest;
++            }
++
++            int at = slot * TransitionQueueCapacity + _queueHead[slot];
++            ReadOnlySpan<byte> s = QueueEntry(slot, _queueHead[slot]);
++            ulong sequence = _queueSequences[at], capture = _queueCaptures[at], accepted = _queueAccepted[at];
++            _deliveredKey[slot] = TransitionKey(slot, s);
++            _queueHead[slot] = (_queueHead[slot] + 1) % TransitionQueueCapacity;
++            _queueCount[slot] = count - 1;
++
++            if (BinaryPrimitives.ReadUInt32LittleEndian(s) == 0)
++            {
++                return new CouchSlotRead(default, trace ? CreateProvenance(NpadInputFreshnessReadStatus.SlotDisabled, slot, true, sequence, capture, accepted, readMachTicks, 0) : default);
++            }
+             var state = (BinaryPrimitives.ReadUInt32LittleEndian(s.Slice(4)), F(s, 8), F(s, 12), F(s, 16), F(s, 20), F(s, 24), F(s, 28));
+-            NpadInputFreshnessProvenance provenance = trace
+-                ? CreateProvenance(status, slot, true, _sequence, _captureTime, _acceptedMachTicks, readMachTicks, 0)
+-                : default;
+-            return new CouchSlotRead(state, provenance);
++            return new CouchSlotRead(state, trace
++                ? CreateProvenance(NpadInputFreshnessReadStatus.FreshEnabled, slot, true, sequence, capture, accepted, readMachTicks, 0)
++                : default);
++        }
++    }
++
++    internal string Summary()
++    {
++        lock (_gate)
++        {
++            return $"CouchInput: queue={(_transitionQueue ? "on" : "off")};accepted={_accepted};" +
++                $"rejected=format:{Interlocked.Read(ref _rejectedFormat)},stale:{Interlocked.Read(ref _rejectedStale)}," +
++                $"invalid:{Interlocked.Read(ref _rejectedInvalid)},order:{_rejectedOrder},stopped:{_rejectedStopped};" +
++                $"superseded={_supersededPackets};heldTransitions={_heldTransitions};collapsedTransitions={_collapsedTransitions};" +
++                $"overflows={_queueOverflows};staleQueueDrops={_staleQueueDrops}";
++        }
++    }
++
++    // Periodic so the counts survive a killed session; quiet when unchanged.
++    private void LogSummaryIfChanged(string reason)
++    {
++        try
++        {
++            long events;
++            lock (_gate)
++            {
++                events = _accepted + _rejectedOrder + _rejectedStopped + _supersededPackets + _heldTransitions +
++                    _collapsedTransitions + _queueOverflows + _staleQueueDrops;
++            }
++            events += Interlocked.Read(ref _rejectedFormat) + Interlocked.Read(ref _rejectedStale) + Interlocked.Read(ref _rejectedInvalid);
++            if (Interlocked.Exchange(ref _loggedEvents, events) == events) return;
++            Logger.Info?.Print(LogClass.Hid, $"{Summary()};reason={reason}");
++        }
++        catch (Exception)
++        {
++            // An exception escaping a timer callback would end the process.
+         }
+     }
+ 
+@@ -267,11 +504,19 @@ internal sealed class CouchReceiver : IDisposable
+             _diagnosticCloseStopped = true;
+             _hasPacket = false;
+             Array.Clear(_latest);
++            for (int slot = 0; slot < 8; slot++)
++            {
++                ClearTransitions(slot);
++                _deliveredKey[slot] = 0;
++            }
+         }
+     }
+ 
+     public void Dispose()
+     {
++        _summaryTimer?.Dispose();
++        _summaryTimer = null;
++        LogSummaryIfChanged("dispose");
+         _stopping = true;
+         _socket.Dispose();
+         _thread.Join(500);
+diff --git a/src/Ryujinx.Input.SDL2/CouchGamepad.cs b/src/Ryujinx.Input.SDL2/CouchGamepad.cs
+index 3489417..65680e3 100644
+--- a/src/Ryujinx.Input.SDL2/CouchGamepad.cs
++++ b/src/Ryujinx.Input.SDL2/CouchGamepad.cs
+@@ -47,7 +47,11 @@ internal sealed class CouchGamepad : IGamepad, IInputFreshnessTraceProvider
+     public void SetLed(uint rgb) { }
+     public void Rumble(float low, float high, uint duration) { }
+     public Vector3 GetMotionData(MotionInputId id) => Vector3.Zero;
+-    public void SetTriggerThreshold(float threshold) => _threshold = threshold;
++    public void SetTriggerThreshold(float threshold)
++    {
++        _threshold = threshold;
++        _receiver.SetTriggerThreshold(_slot, threshold);
++    }
+ 
+     public void SetConfiguration(InputConfig config)
+     {
+@@ -55,6 +59,7 @@ internal sealed class CouchGamepad : IGamepad, IInputFreshnessTraceProvider
+         {
+             _config = (StandardControllerInputConfig)config;
+             _threshold = _config.TriggerThreshold;
++            _receiver.SetTriggerThreshold(_slot, _threshold);
+         }
+     }
+ 
+@@ -75,7 +80,7 @@ internal sealed class CouchGamepad : IGamepad, IInputFreshnessTraceProvider
+     public GamepadStateSnapshot GetMappedStateSnapshot(out NpadInputFreshnessProvenance provenance)
+     {
+         bool trace = InputFreshnessTraceEnabled;
+-        CouchSlotRead selected = _receiver.ReadSnapshot(_slot, trace);
++        CouchSlotRead selected = _receiver.ReadNextSnapshot(_slot, trace);
+         GamepadStateSnapshot raw = ToGamepadState(selected);
+         GamepadStateSnapshot mapped = MapState(raw);
+ 
+diff --git a/src/Ryujinx.Memory/Range/RangeList.cs b/src/Ryujinx.Memory/Range/RangeList.cs
+index 72cef1d..e8f70f0 100644
+--- a/src/Ryujinx.Memory/Range/RangeList.cs
++++ b/src/Ryujinx.Memory/Range/RangeList.cs
+@@ -174,6 +174,40 @@ namespace Ryujinx.Memory.Range
+             return false;
+         }
+ 
++        /// <summary>
++        /// Removes every item that matches the predicate in one pass, keeping the order of the others.
++        /// </summary>
++        /// <remarks>
++        /// Unlike repeated <see cref="Remove"/> calls, which shift the tail of the list once per item,
++        /// this is linear in the size of the list.
++        /// </remarks>
++        /// <param name="match">Predicate that selects the items to remove</param>
++        /// <returns>The number of items removed</returns>
++        public int RemoveAll(Predicate<T> match)
++        {
++            int write = 0;
++
++            for (int read = 0; read < Count; read++)
++            {
++                if (!match(_items[read].Value))
++                {
++                    if (write != read)
++                    {
++                        _items[write] = _items[read];
++                    }
++
++                    write++;
++                }
++            }
++
++            int removed = Count - write;
++
++            Array.Clear(_items, write, removed);
++            Count = write;
++
++            return removed;
++        }
++
+         /// <summary>
+         /// Updates an item's end address.
+         /// </summary>
+diff --git a/src/Ryujinx.Memory/Tracking/MemoryTracking.cs b/src/Ryujinx.Memory/Tracking/MemoryTracking.cs
+index e7791fe..d4a71db 100644
+--- a/src/Ryujinx.Memory/Tracking/MemoryTracking.cs
++++ b/src/Ryujinx.Memory/Tracking/MemoryTracking.cs
+@@ -1,5 +1,6 @@
+ using Ryujinx.Common.Pools;
+ using Ryujinx.Memory.Range;
++using System;
+ using System.Collections.Generic;
+ 
+ namespace Ryujinx.Memory.Tracking
+@@ -82,7 +83,7 @@ namespace Ryujinx.Memory.Tracking
+                 {
+                     NonOverlappingRangeList<VirtualRegion> regions = type == 0 ? _virtualRegions : _guestVirtualRegions;
+ 
+-                    int count = regions.FindOverlapsNonOverlapping(va, size, ref overlaps);
++                    int count = FindOverlaps(regions, va, size, ref overlaps);
+ 
+                     for (int i = 0; i < count; i++)
+                     {
+@@ -120,7 +121,7 @@ namespace Ryujinx.Memory.Tracking
+                 {
+                     NonOverlappingRangeList<VirtualRegion> regions = type == 0 ? _virtualRegions : _guestVirtualRegions;
+ 
+-                    int count = regions.FindOverlapsNonOverlapping(va, size, ref overlaps);
++                    int count = FindOverlaps(regions, va, size, ref overlaps);
+ 
+                     for (int i = 0; i < count; i++)
+                     {
+@@ -167,6 +168,12 @@ namespace Ryujinx.Memory.Tracking
+         {
+             List<VirtualRegion> result = [];
+             NonOverlappingRangeList<VirtualRegion> regions = guest ? _guestVirtualRegions : _virtualRegions;
++
++            if (_bulkReleaseDepth != 0)
++            {
++                RemoveEmptyRegions(regions, va, size);
++            }
++
+             regions.GetOrAddRegions(result, va, size, (va, size) => new VirtualRegion(this, va, size, guest));
+ 
+             return result;
+@@ -188,6 +195,109 @@ namespace Ryujinx.Memory.Tracking
+             }
+         }
+ 
++        // Releasing every handle of a process (GPU cache teardown) empties regions in ascending address order, and
++        // each removal from the sorted region lists shifts nearly the whole list: quadratic in the region count,
++        // tens of seconds after long sessions. Inside a bulk release, emptied regions stay listed and are removed in
++        // one pass when the outermost release ends. Until then nothing else sees them: memory events and mapping
++        // changes skip them (FindOverlaps), and a handle created meanwhile has the ones in its range removed first
++        // (RemoveEmptyRegions), so it gets the regions it would have got without the release.
++        // Only touched under TrackingLock.
++        private int _bulkReleaseDepth;
++
++        internal bool DeferRegionRemoval => _bulkReleaseDepth != 0;
++
++        /// <summary>
++        /// Removes the regions without handles that overlap a range. This assumes that the lock has been acquired.
++        /// </summary>
++        /// <param name="regions">Region list to remove from</param>
++        /// <param name="address">Start address of the range</param>
++        /// <param name="size">Size of the range</param>
++        private static void RemoveEmptyRegions(NonOverlappingRangeList<VirtualRegion> regions, ulong address, ulong size)
++        {
++            // Not the thread-static array: a caller up the stack may be iterating it.
++            VirtualRegion[] overlaps = new VirtualRegion[4];
++
++            int count = regions.FindOverlapsNonOverlapping(address, size, ref overlaps);
++
++            for (int i = 0; i < count; i++)
++            {
++                if (overlaps[i].Handles.Count == 0)
++                {
++                    regions.Remove(overlaps[i]);
++                }
++            }
++        }
++
++        /// <summary>
++        /// Finds the regions overlapping a range, leaving out regions emptied during a bulk release.
++        /// This assumes that the lock has been acquired.
++        /// </summary>
++        /// <param name="regions">Region list to search</param>
++        /// <param name="address">Start address of the range</param>
++        /// <param name="size">Size of the range</param>
++        /// <param name="overlaps">Array that receives the overlapping regions</param>
++        /// <returns>The number of overlapping regions</returns>
++        private int FindOverlaps(NonOverlappingRangeList<VirtualRegion> regions, ulong address, ulong size, ref VirtualRegion[] overlaps)
++        {
++            if (_bulkReleaseDepth == 0)
++            {
++                return regions.FindOverlapsNonOverlapping(address, size, ref overlaps);
++            }
++
++            // Looked up into separate storage, then only the live regions are copied out: the array is usually the
++            // thread-static one, which a traversal further up the stack (whose handle action led here) may still be
++            // iterating, so it must receive exactly what it would have if the emptied regions were already removed.
++            VirtualRegion[] found = new VirtualRegion[4];
++
++            int count = regions.FindOverlapsNonOverlapping(address, size, ref found);
++            int live = 0;
++
++            for (int i = 0; i < count; i++)
++            {
++                if (found[i].Handles.Count != 0)
++                {
++                    if (live == overlaps.Length)
++                    {
++                        Array.Resize(ref overlaps, count);
++                    }
++
++                    overlaps[live++] = found[i];
++                }
++            }
++
++            return live;
++        }
++
++        /// <summary>
++        /// Starts releasing many handles at once. Regions emptied until the matching <see cref="EndBulkRelease"/>
++        /// are removed together at the end instead of one by one. Protection updates are unchanged.
++        /// </summary>
++        public void BeginBulkRelease()
++        {
++            lock (TrackingLock)
++            {
++                _bulkReleaseDepth++;
++            }
++        }
++
++        /// <summary>
++        /// Ends a bulk release started with <see cref="BeginBulkRelease"/>. The outermost call removes every region
++        /// left without handles.
++        /// </summary>
++        public void EndBulkRelease()
++        {
++            lock (TrackingLock)
++            {
++                if (_bulkReleaseDepth == 0 || --_bulkReleaseDepth != 0)
++                {
++                    return;
++                }
++
++                _virtualRegions.RemoveAll(region => region.Handles.Count == 0);
++                _guestVirtualRegions.RemoveAll(region => region.Handles.Count == 0);
++            }
++        }
++
+         /// <summary>
+         /// Obtains a memory tracking handle for the given virtual region, with a specified granularity. This should be disposed when finished with.
+         /// </summary>
+@@ -300,7 +410,7 @@ namespace Ryujinx.Memory.Tracking
+ 
+                 NonOverlappingRangeList<VirtualRegion> regions = guest ? _guestVirtualRegions : _virtualRegions;
+ 
+-                int count = regions.FindOverlapsNonOverlapping(address, size, ref overlaps);
++                int count = FindOverlaps(regions, address, size, ref overlaps);
+ 
+                 if (count == 0 && !precise)
+                 {
+@@ -372,7 +482,23 @@ namespace Ryujinx.Memory.Tracking
+         {
+             lock (TrackingLock)
+             {
+-                return _virtualRegions.Count;
++                if (_bulkReleaseDepth == 0)
++                {
++                    return _virtualRegions.Count;
++                }
++
++                // Regions emptied during a bulk release stay listed until it ends; they are not counted.
++                int count = 0;
++
++                foreach (VirtualRegion region in _virtualRegions)
++                {
++                    if (region.Handles.Count != 0)
++                    {
++                        count++;
++                    }
++                }
++
++                return count;
+             }
+         }
+     }
+diff --git a/src/Ryujinx.Memory/Tracking/VirtualRegion.cs b/src/Ryujinx.Memory/Tracking/VirtualRegion.cs
+index f9267d8..7737c4b 100644
+--- a/src/Ryujinx.Memory/Tracking/VirtualRegion.cs
++++ b/src/Ryujinx.Memory/Tracking/VirtualRegion.cs
+@@ -120,7 +120,8 @@ namespace Ryujinx.Memory.Tracking
+         }
+ 
+         /// <summary>
+-        /// Removes a handle from this virtual region. If there are no handles left, this virtual region is removed.
++        /// Removes a handle from this virtual region. If there are no handles left, this virtual region is removed,
++        /// or, during a bulk release, left for the tracking to remove when the release ends.
+         /// </summary>
+         /// <param name="handle">Handle to remove</param>
+         public void RemoveHandle(RegionHandle handle)
+@@ -129,7 +130,7 @@ namespace Ryujinx.Memory.Tracking
+             {
+                 Handles.Remove(handle);
+                 UpdateProtection();
+-                if (Handles.Count == 0)
++                if (Handles.Count == 0 && !_tracking.DeferRegionRemoval)
+                 {
+                     _tracking.RemoveVirtual(this);
+                 }

@@ -1,34 +1,29 @@
-# Current status — October 9, 2026
+# Smash Couch 最新进度 — 2026-10-11
 
-The `.53` native Metal candidate has completed a diagnostic replay and ordinary close. It is not installed or promoted. The installed `.36` emulator/R3 launcher and current progress remain preserved.
+当前正式安装：**Smash Couch 58.2.0 / 原生 Metal .58 r15**。用户最新反馈：“It is super smooth now which is awesome”。这是当前本机实际游玩的主观反馈；不等于所有角色、场景、显示器和控制器组合均已通过性能验证。
 
-## Source changes
+## 已安装的改进
 
-The cumulative overlay includes the native Metal renderer, guarded depth/stencil handling, pipeline recipe caching, frame/presentation diagnostics, controller transport and input tracing, memory witnesses, allocation improvements, and the latest VI shutdown cancellation repair. The pipeline cache key ignores dormant blend fields only when their color attachment is invalid, matching the actual Metal descriptor construction. The shutdown repair handles canceled service requests without returning success with an invalid buffer slot.
+- 渲染：对已支持的反馈绘制类别采用绘制前纹理副本，保留必要同步与类别保护。记录的巡视测试为零跳过；未支持类别仍保留保护，不能据此宣称所有绘制均已解决。
+- 着色器：有界后台程序编译、片段阶段并行编译、精确键匹配的首次绘制流水线预备。流水线配方每 60 秒原子保存，限制为 16,384 条 / 32 MiB；缓存不再只靠正常退出保存。未见过的变体仍可能同步编译。
+- 输入：按玩家槽位保存有序、有界的输入转换队列，修正触发器阈值转换，并保留超时归零与重连隔离。不能据此宣称物理按键到屏幕延迟已测量，或任意冻结期间都不会丢输入。
+- 内存：编译后压缩保留的 MSL 文本，减少长期托管堆占用；r10 长时间巡视中约 2.3–2.6 GiB，之前约 3.5 GiB。当前托管堆上限 8 GiB，整进程另有采样保护，不能把提高上限本身称为修复。
+- 退出：r14 在 GPU 缓存销毁期间批量释放追踪区域，修正嵌套查询；记录的约一小时会话退出为 0.33 秒，而旧 r10 为约 27 秒。93 项离线检查通过。
+- 稳定性：r15 对宿主线程访问未映射客体页逐页处理，保留已映射部分，对未映射读取置零、写入丢弃；客体线程路径不变。读取边界探针通过；该次写入探针未实际执行，不能称为写路径运行验证或保证永不崩溃。
+- 启动器：58.2.0 默认 Smash 标准位置映射，四个 Switch 面键均可到达；移除缺少面键的重复攻击布局。Xbox A→Switch B，B→A，X→Y，Y→X；游戏内可自行改键。旧文档中 B 与 X 同时攻击的要求已被之后的用户方向取代。
 
-The complete emulator source is pinned to Ryubing `eb6b0e9adca0c2f010fa6ac093c806c4db199283` plus this overlay. Its 5,175 source files match tree SHA-256 `9c0a0df73d3f506ead4760132d8c0be82bb0b255bc1b5fd4fc8d5c604bb695d0`.
+## 证据范围
 
-## Native replay evidence
+最新版运行目录预热记录：首次约 2 分 41.7 秒，第二次约 34.3 秒，退出均为 0，未记录错误；本地累计约 18,766 个程序、13,119 条配方。它们是本机、该内容覆盖下的记录，不是任何机器的启动承诺。程序与配方缓存不随源码公开。
 
-Run199 completed Kirby versus Fox, both CPU level 9, on Battlefield. The gameplay and result images were inspected, normal clock progression was supported, and all seven owned processes and endpoints closed. Game, runner, observer, controller carrier and end helper exited 0. The preceding Busy/NoSlots shutdown error pair was absent under the unchanged classifier.
+r6 与 .57 的配对回放比较满足冻结规则；后来的 r10 与 .57 比较未通过该规则。环境抖动解释尚未证实，因此不能把所有 .58 改动描述为已受控证明的性能提升。90 分钟巡视属于 r10，不能自动转移为 r15 的同等时长验证。巡视包含 CPU 3，不能冒充 CPU 9 或真实八控制器测试。
 
-| Presentation sample | Frames | Maximum interval | Above 33.34 ms / 100 ms |
-| --- | ---: | ---: | ---: |
-| Original 90 seconds | 5,399 | 16.6668 ms | 0 / 0 |
-| Broader 175 seconds | 10,499 | 29.1665 ms | 0 / 0 |
+保留问题：结果画面每局约一次 280–300 ms 间隔的原因仍未解决；新角色、新效果和未见变体可能首次编译卡顿；未解锁角色未覆盖。物理端到端延迟、两/四/八控制器完整验收、电视和电池模式仍有验证空缺。此前用户反馈还提到输入组合与延迟，现已收到“super smooth”的最新反馈，不能据此删除所有输入调查。
 
-The broader sample still contains 29 intervals at 25 ms, eight at 20.833 ms and one at 29.166 ms. This does not establish perfect pacing or physical input latency. Run199 used API validation on, global GPU shader validation off, eight server heaps, a 2.5 GiB managed limit and 1,823 retained recipe records. Its results are not a controlled speedup comparison with earlier scenes or cache conditions. Late Battlefield purple/black levels remain unresolved.
+## 开发中，尚未安装
 
-## Normal launcher and latest attempts
+58.3 / r16 工作包括：任意面键加入、多人同时加入、统一标准映射、数字扳机与交接锁存、被动输入遥测、原生全屏快捷键，以及刷新节奏对齐候选。这些不属于本次验证的 58.2.0 安装，也没有被宣传为已验收。
 
-Run200 used the API-off normal profile without a managed heap cap. It reached native fullscreen startup, then refused a stale title review. No match occurred. The existing 8 GiB sampled process guard later stopped it. Managed-heap and whole-process limits measure different things; the memory split and cause remain unresolved.
+## 本次 GitHub 更新
 
-The separately reviewed `53.2.0` launcher restores `DOTNET_gcServer=1`, `DOTNET_GCHeapCount=8`, and `DOTNET_GCHeapHardLimit=0xA0000000`, with API and global shader validation off. The 8 GiB sampled process guard remains unchanged. This capped normal profile has source/CPU/build evidence and has not passed a full normal-profile replay.
-
-Run201 closed before a match after a transitional title image. Prepared AC Run202 was retained. The user's authorized battery revision, Run203, started and closed normally, but its fresh image showed How to Play rather than the expected prompt. It did not reach a match or yield a performance sample. At this publication checkpoint, the live owner is preparing Run204, a short existing input-trace diagnostic to distinguish sender acknowledgment from Player 1 HID publication. That work is outside this frozen source snapshot. Battery observations must not be described as power-matched to earlier AC results.
-
-## UI preview
-
-The current UI uses a light layout, simpler Home screen and controller-first preset selection. Jump, Quick attack and Special appear as separate rows with button badges. Xbox, PlayStation, Switch, Auto and Other labels are supported. Xbox A-to-jump and Brawlhalla-style face-button presets are included. Brawlhalla-style describes the mapping; it does not implement Brawlhalla mechanics.
-
-The preview has 105 regression, 29 presentation/isolation and 35 controller-preset checks recorded. Its Play action records intent only. The original live model is retained as source and excluded from the preview build. Live integration, physical mappings/reconnection, multiple controllers, TV presentation, current-data launch/close checks and promotion remain open.
+本次公开的是 [58.2.0 源码快照](releases/58.2.0)、完整源码哈希清单、增量补丁、构建方法、安装版本身份和回滚说明。保留 10 月 9 日的 .53 历史快照及原项目，不覆盖正在进行的本地修改。没有上传 Nintendo 游戏、密钥、固件、存档、游戏派生缓存或签名应用程序。本次发布检查不启动游戏，也不改动当前安装。

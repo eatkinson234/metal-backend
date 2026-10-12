@@ -1,6 +1,8 @@
-# Latest Smash Couch work — October 9, 2026
+# 最新 Smash Couch 进度 — 2026-10-11
 
-The current native Metal `.53` source snapshot, capped `53.2.0` launcher and light UI preview are in [smash-couch](smash-couch/README.md). See its [status](smash-couch/STATUS.md) for completed diagnostic evidence and remaining validation. The candidate is not installed or promoted.
+**当前已安装：Smash Couch 58.2.0 / 原生 Metal .58 r15。** 用户最新反馈：“It is super smooth now which is awesome”。
+
+最新源码、完整身份清单、构建和回滚说明位于 [smash-couch/releases/58.2.0](smash-couch/releases/58.2.0)。[最新状态](smash-couch/STATUS.md) 区分已安装修复、已有测试证据、尚未覆盖的情况，以及未安装的 58.3/r16 开发。历史 .53 和原项目源码保持保留。
 
 ---
 
