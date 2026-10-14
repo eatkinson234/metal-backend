@@ -1,10 +1,10 @@
-# 最新 Smash Couch 进度 — 2026-10-12
+# 最新 Smash Couch 进度 — 2026-10-13
 
-**最新已安装：Smash Couch 58.3.0 + 原生 Metal .58 r16。** 本次已重新核对安装的两个可执行文件及包清单 SHA-256。当前保留 legacy pacing。
+**当前正式安装：Smash Couch 58.4.0 + 原生 Metal .58 r21。** 新帧节奏已启用，版本/可执行文件/包清单均重新核对。
 
-[最新状态](smash-couch/STATUS.md) · [已安装版本源码/构建/回滚](smash-couch/releases/58.3.0) · [r19 最新实验，未安装](smash-couch/experiments/r19)
+[下载 Smash Couch 启动器应用](smash-couch/downloads) · [How to use / 使用说明](smash-couch/HOW-TO-USE.md) · [最新进度](smash-couch/STATUS.md) · [源码/构建/回滚](smash-couch/releases/58.4.0)
 
-此前“super smooth”用户反馈保留；新版本未覆盖的物理控制器、输入延迟和显示场景仍明确列出。历史 .53、58.2.0 与原项目保持保留。
+下载仅含大厅应用，依赖本地批准运行包；**不含 Smash Bros 游戏、模拟器应用、密钥、固件、存档或缓存**。短队列与内存候选仍未安装；已知限制明确列出，历史快照与原项目保持保留。
 
 ---
 

@@ -1,0 +1,72 @@
+From ce275b2080e4251459e4b7dc08b5f887cd527bae Mon Sep 17 00:00:00 2001
+From: Smash Couch overnight <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 07:06:52 -0600
+Subject: [PATCH] Depth snapshots weigh their command buffer (memory spike,
+ FIX-PLAN step 1; draft)
+
+A depth feedback snapshot is freed only when the command buffer that used it
+completes, but unlike the feedback colour copies it added no byte weight, so
+nothing submitted a command buffer early because of snapshot memory.
+FinishFeedbackDraw now passes the snapshot's allocated size (as counted by the
+step-0 residency diagnostics) to FlushCommandsIfWeightExceeding, as
+FinishFeedbackCopies does for copies (256 MiB threshold), with the lease still
+disposed in a finally. Snapshots of unknown size add no weight (r21 behaviour).
+
+Behavioural change: extra command-buffer submissions in snapshot-heavy frames.
+It bounds memory only if snapshots wait for submission; if the GPU itself is
+behind, a bound on bytes in flight (step 4) is needed. Decide with the step-0
+data. Compile-checked; not built into an app, not run, not reviewed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Ryujinx.Graphics.Metal/DepthFeedbackSnapshot.cs |  6 +++++-
+ src/Ryujinx.Graphics.Metal/EncoderStateManager.cs   | 12 +++++++++++-
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/Ryujinx.Graphics.Metal/DepthFeedbackSnapshot.cs b/src/Ryujinx.Graphics.Metal/DepthFeedbackSnapshot.cs
+index edb3eb0..5261595 100644
+--- a/src/Ryujinx.Graphics.Metal/DepthFeedbackSnapshot.cs
++++ b/src/Ryujinx.Graphics.Metal/DepthFeedbackSnapshot.cs
+@@ -24,11 +24,15 @@ namespace Ryujinx.Graphics.Metal
+         private Texture _snapshot;
+         private readonly List<MTLTexture> _retainedSourceHandles = new(3);
+         private int _disposed;
+-        // Diagnostics only (DepthSnapshotResidency): allocated bytes and the timestamp they were counted at.
++        // Allocated bytes and the timestamp they were counted at (DepthSnapshotResidency); the bytes also weigh the
++        // command buffer that holds the snapshot (EncoderStateManager.FinishFeedbackDraw).
+         private long _trackedBytes, _trackedSince;
+ 
+         internal Texture Texture => _snapshot;
+ 
++        // The snapshot root's allocated size as counted by TrackResidency; 0 if never tracked or the size was unknown.
++        internal ulong Bytes => (ulong)Math.Max(0, Volatile.Read(ref _trackedBytes));
++
+         internal DepthFeedbackSnapshot(Texture snapshot, MTLTexture borrowedSourceSampling,
+             MTLTexture borrowedSourceIdentity, IntPtr borrowedRoot)
+         {
+diff --git a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+index 507712c..815f3f9 100644
+--- a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
++++ b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+@@ -521,7 +521,17 @@ namespace Ryujinx.Graphics.Metal
+                 _snapshotSourceRoot = IntPtr.Zero;
+                 _snapshotContext = null;
+                 _snapshotReadonlyStencil148 = false;
+-                lease.Dispose(); // Command-buffer dependency persists until fence.
++                try
++                {
++                    // The snapshot is freed only when this command buffer completes; count its bytes like the
++                    // feedback copies above, so a frame with many snapshot draws is submitted before memory piles up
++                    // (memory spike, FIX-PLAN step 1). 0 bytes (size unknown) adds no weight, as in r21.
++                    _pipeline.FlushCommandsIfWeightExceeding(lease, lease.GetUnsafe().Bytes);
++                }
++                finally
++                {
++                    lease.Dispose(); // Command-buffer dependency persists until fence.
++                }
+             }
+         }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

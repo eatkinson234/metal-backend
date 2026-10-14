@@ -1,0 +1,16 @@
+{
+  "launcher_version": "58.4.0",
+  "launcher_executable_sha256": "ffff63f6c20ae799fdcf956a7291b8e3f4dcde2aece0a88d6c753ef3cffc2f77",
+  "launcher_source_commit": "921c5533659f104f319f3346ae54bae4f02cdb95",
+  "emulator_version": "1.3.3-metal.58-correctness-r21",
+  "emulator_source_commit": "c1283fddf35e96f68e2b644cca71b53686cf1f07",
+  "emulator_packaged_executable": {
+    "bytes": 73564720,
+    "sha256": "f639a6f77ed2f6f29500f6764786007f4425024688ed44363ee6e12fff707fe2"
+  },
+  "runtime_manifest_sha256": "5a1c5c6e607b8190ed93a0eba7f6c34e9f9b0449fcdef26a617a9d9e9c743ead",
+  "installed_utc": "2026-10-13T07:03:51Z",
+  "pacing_mode": "New r21 pacing; pacing-legacy marker absent. Recorded installation/prewarm confirms active.",
+  "source_tree_sha256": "b75f43eb1fbb8b4f5ca20e55ef70304648ba865a42f60b8774182f9ac917e173",
+  "checked_utc": "2026-10-14T04:17:44.716354+00:00"
+}

@@ -1,0 +1,227 @@
+diff --git a/src/Ryujinx.Graphics.Metal/ConcurrentCompilation.cs b/src/Ryujinx.Graphics.Metal/ConcurrentCompilation.cs
+new file mode 100644
+index 0000000..c9f3d53
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/ConcurrentCompilation.cs
+@@ -0,0 +1,57 @@
++using Ryujinx.Common.Logging;
++using SharpMetal.Metal;
++using System;
++using System.IO;
++using System.Runtime.Versioning;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Fable audit 3.5 experiment, off by default: MTLDevice.shouldMaximizeConcurrentCompilation lets Metal's compiler
++    // service run as many compilation tasks at once as it can, instead of its default pool. Set once on the new device,
++    // before any program or pipeline compiles. SMASH_COUCH_MAX_CONCURRENT_COMPILE=1 (rig A/B; when set it wins, anything
++    // else is off) or a file named max-concurrent-compile in the private data directory the launcher passes
++    // (SMASH_COUCH_PRIVATE_DATA) turns it on at the next game launch. One log line either way with the task count.
++    [SupportedOSPlatform("macos")]
++    static class ConcurrentCompilation
++    {
++        public const string FlagFileName = "max-concurrent-compile";
++
++        public static void Apply(MTLDevice device)
++        {
++            bool on = Read(Environment.GetEnvironmentVariable("SMASH_COUCH_MAX_CONCURRENT_COMPILE"),
++                Environment.GetEnvironmentVariable("SMASH_COUCH_PRIVATE_DATA"));
++            try
++            {
++                var before = device.MaximumConcurrentCompilationTaskCount;
++                if (on)
++                {
++                    device.ShouldMaximizeConcurrentCompilation = true;
++                }
++                Logger.Info?.Print(LogClass.Gpu, $"[MetalCompile] maximizeConcurrent={device.ShouldMaximizeConcurrentCompilation};" +
++                    $"requested={on};taskCount={before}->{device.MaximumConcurrentCompilationTaskCount}");
++            }
++            catch (Exception exception)
++            {
++                // Diagnostics and an optional hint only: never stop the renderer over them.
++                Logger.Warning?.Print(LogClass.Gpu, $"[MetalCompile] could not read or set concurrent compilation: {exception.Message}");
++            }
++        }
++
++        private static bool Read(string variable, string privateData)
++        {
++            if (!string.IsNullOrEmpty(variable))
++            {
++                return variable == "1";
++            }
++            try
++            {
++                return !string.IsNullOrEmpty(privateData) && Path.IsPathFullyQualified(privateData) &&
++                    File.Exists(Path.Combine(privateData, FlagFileName));
++            }
++            catch (Exception)
++            {
++                return false;
++            }
++        }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Metal/MetalRenderer.cs b/src/Ryujinx.Graphics.Metal/MetalRenderer.cs
+index 0ef18c7..af5cb90 100644
+--- a/src/Ryujinx.Graphics.Metal/MetalRenderer.cs
++++ b/src/Ryujinx.Graphics.Metal/MetalRenderer.cs
+@@ -68,6 +68,7 @@ namespace Ryujinx.Graphics.Metal
+             NativeTimingDiagnostics.Initialize();
+             ProgramStageCompilers.Install();
+             _device = MTLDevice.CreateSystemDefaultDevice();
++            ConcurrentCompilation.Apply(_device);
+             Programs = new();
+             Samplers = [];
+ 
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueCore.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueCore.cs
+index 4aa52d7..898ed8a 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueCore.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueCore.cs
+@@ -281,7 +281,8 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                 }
+             }
+ 
+-            if (needBufferReleaseSignal)
++            // Experiment, off by default: while the guest queue limit holds, a free slot does not signal the guest.
++            if (needBufferReleaseSignal && !GuestQueueLimit.Holds(this))
+             {
+                 SignalWaitBufferFreeEvent();
+             }
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs
+index 3eed34a..049a750 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs
+@@ -837,12 +837,21 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                 }
+ 
+                 bool tooManyBuffers = Core.Queue.Count > maxBufferCount;
++                // Experiment, off by default: see GuestQueueLimit.
++                bool queueLimited = GuestQueueLimit.Holds(Core);
+ 
+-                tryAgain = freeSlot == BufferSlotArray.InvalidBufferSlot || tooManyBuffers;
++                tryAgain = freeSlot == BufferSlotArray.InvalidBufferSlot || tooManyBuffers || queueLimited;
+ 
+                 if (tryAgain)
+                 {
+-                    if (async || (Core.DequeueBufferCannotBlock && acquiredCount < Core.MaxAcquiredBufferCount))
++                    bool wouldBlock = async || (Core.DequeueBufferCannotBlock && acquiredCount < Core.MaxAcquiredBufferCount);
++
++                    if (queueLimited && freeSlot != BufferSlotArray.InvalidBufferSlot && !tooManyBuffers)
++                    {
++                        GuestQueueLimit.OnHeld(wouldBlock);
++                    }
++
++                    if (wouldBlock)
+                     {
+                         Core.CheckSystemEventsLocked(maxBufferCount);
+ 
+@@ -854,6 +863,11 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                 }
+             }
+ 
++            if (GuestQueueLimit.Value > 0)
++            {
++                GuestQueueLimit.OnDequeued(async);
++            }
++
+             return Status.Success;
+         }
+ 
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/GuestQueueLimit.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/GuestQueueLimit.cs
+new file mode 100644
+index 0000000..fe73f31
+--- /dev/null
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/GuestQueueLimit.cs
+@@ -0,0 +1,92 @@
++using Ryujinx.Common.Logging;
++using System;
++using System.Diagnostics;
++using System.Globalization;
++using System.IO;
++
++namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
++{
++    // Off by default. While N (1 or 2) frames are already queued, the producer may not dequeue another buffer, so the
++    // guest runs at most about N frames ahead of the composer instead of filling every buffer (depth 3, about 48 ms from
++    // QueueBuffer to acquire at 60 fps, with the frame's GPU work already done at QueueBuffer). A blocking dequeue waits;
++    // an async one (libnx-style: wait on the buffer-free event, then dequeue) gets WouldBlock and the buffer-free event
++    // stays clear while the limit holds. The composer's acquire wakes both as it does for a free slot, so the guest stays
++    // paced by the composer (unlike dropping stale frames, which would let it run faster). One summary line every 10 s.
++    // N comes from SMASH_COUCH_GUEST_QUEUE_LIMIT (rig A/B; when set it wins, and 0 or junk is off) or else from a file
++    // named guest-queue-limit holding 1 or 2 in the private data directory the launcher passes (SMASH_COUCH_PRIVATE_DATA),
++    // so a couch session can turn it on or off at the next game launch without reinstalling.
++    static class GuestQueueLimit
++    {
++        public const string FlagFileName = "guest-queue-limit";
++
++        public static readonly int Value = Read(
++            Environment.GetEnvironmentVariable("SMASH_COUCH_GUEST_QUEUE_LIMIT"),
++            Environment.GetEnvironmentVariable("SMASH_COUCH_PRIVATE_DATA"));
++
++        private static long _dequeues, _async, _limited, _wouldBlock, _waitTicks, _maxWaitTicks, _windowStart, _heldSince;
++
++        private static int Read(string variable, string privateData)
++        {
++            if (!string.IsNullOrEmpty(variable))
++            {
++                return Parse(variable);
++            }
++            try
++            {
++                if (!string.IsNullOrEmpty(privateData) && Path.IsPathFullyQualified(privateData))
++                {
++                    string flag = Path.Combine(privateData, FlagFileName);
++                    if (File.Exists(flag))
++                    {
++                        return Parse(File.ReadAllText(flag).Trim());
++                    }
++                }
++            }
++            catch (Exception)
++            {
++                // An unreadable private data path or flag file keeps the limit off.
++            }
++            return 0;
++        }
++
++        private static int Parse(string value) =>
++            int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int limit) && limit >= 1 && limit <= 2 ? limit : 0;
++
++        // Under Core.Lock: whether the limit holds the producer back now.
++        public static bool Holds(BufferQueueCore core) => Value > 0 && core.BufferHasBeenQueued && core.Queue.Count >= Value;
++
++        // Under Core.Lock: a dequeue found a free slot but waits (blocking) or returns WouldBlock (async) only because of
++        // the limit.
++        public static void OnHeld(bool wouldBlock)
++        {
++            if (_heldSince == 0) _heldSince = Stopwatch.GetTimestamp();
++            if (wouldBlock) _wouldBlock++;
++        }
++
++        // Under Core.Lock, after a successful dequeue.
++        public static void OnDequeued(bool async)
++        {
++            long now = Stopwatch.GetTimestamp();
++            if (_windowStart == 0) _windowStart = now;
++            _dequeues++;
++            if (async) _async++;
++            if (_heldSince != 0)
++            {
++                long waited = now - _heldSince;
++                _limited++;
++                _waitTicks += waited;
++                _maxWaitTicks = Math.Max(_maxWaitTicks, waited);
++                _heldSince = 0;
++            }
++            if (now - _windowStart >= Stopwatch.Frequency * 10)
++            {
++                double ms = 1000.0 / Stopwatch.Frequency;
++                Logger.Info?.PrintMsg(LogClass.SurfaceFlinger, string.Create(CultureInfo.InvariantCulture,
++                    $"[GuestQueueLimit] limit={Value};dequeues={_dequeues};async={_async};limited={_limited};" +
++                    $"wouldBlock={_wouldBlock};waitMs={_waitTicks * ms:F1};maxWaitMs={_maxWaitTicks * ms:F2}"));
++                _windowStart = now;
++                _dequeues = _async = _limited = _wouldBlock = _waitTicks = _maxWaitTicks = 0;
++            }
++        }
++    }
++}

@@ -1,0 +1,15 @@
+{
+  "status": "UNINSTALLED_EXPERIMENT",
+  "source_commit": "3f45c20a051b9fe33da8c70df90975b86c1a1e13",
+  "base_source_tree_sha256": "b75f43eb1fbb8b4f5ca20e55ef70304648ba865a42f60b8774182f9ac917e173",
+  "source_tree_sha256": "dc96192867e8938c417aefd4d75c775b93225eeac23f12307d974a1176ff15cc",
+  "source_file_count": 5200,
+  "changed_files": {
+    "src/Ryujinx.Graphics.Metal/ConcurrentCompilation.cs": "7f4fd9e269f312eaf7ac705a03fe80574a7465b08087ec39949cf51e2aff5503",
+    "src/Ryujinx.Graphics.Metal/MetalRenderer.cs": "5272ae8a982873633c2e0e13e6e21e730d24993c0c3fb4b29a07b24ea97901ed",
+    "src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueCore.cs": "7763b0f39d16539723d62d0c29dddb4abbc30988a9c40da926e60873eabd1c9d",
+    "src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs": "c17770ca1a917239c7992a49bf39514194deab89ca765697875d921570f01ac3",
+    "src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/GuestQueueLimit.cs": "9357f064ab10490bbd082d370e3f5ab7162ecd96bacfb2ff66a8248c2a21d029"
+  },
+  "acceptance": "Guest queue limit and concurrent compilation are experimental. Two-frame option not installed; match-end repeat-frame tradeoff remains. Concurrent compilation stayed off after no measured cold-load benefit."
+}

@@ -1,0 +1,41 @@
+{
+  "archive": "Smash-Couch-58.4.0-macOS-arm64.zip",
+  "bytes": 1543175,
+  "sha256": "6bf28320a045bd01a5cfd9941c8e9864b286f306d31f9d6544882a4ca4860119",
+  "git_blob_sha1": "ca0c8271e5122247a0aa57b63768fbb6389aa1c2",
+  "version": "58.4.0",
+  "architecture": "arm64",
+  "bundle_minimum_macos": "14.0",
+  "signature": "Ad hoc; no Developer ID; not notarized",
+  "signature_verified_after_zip_roundtrip": true,
+  "files": {
+    "Contents/Info.plist": {
+      "bytes": 923,
+      "sha256": "a7512ebeb481c8ac103d88cd6f4240f568f24550fa3585e30e29473c4e83c3e6"
+    },
+    "Contents/MacOS/SmashCouchNativeMetal": {
+      "bytes": 1804384,
+      "sha256": "ffff63f6c20ae799fdcf956a7291b8e3f4dcde2aece0a88d6c753ef3cffc2f77"
+    },
+    "Contents/Resources/AppIcon.icns": {
+      "bytes": 1053212,
+      "sha256": "bc511ace19489d82d42f49699fcfafe55cc1a181f85c9ba190118b446173c630"
+    },
+    "Contents/_CodeSignature/CodeResources": {
+      "bytes": 2446,
+      "sha256": "2830cc00673ce71bb2c9510702433d2619e48c0ace4410e9ca83aabdea9db838"
+    }
+  },
+  "contents": "Four launcher app files plus offline README and MIT license. No emulator executable/bundle, Nintendo game, firmware, keys, save, configuration, or shader cache.",
+  "prerequisites": "Existing approved compatible local runtime and personal game setup; launcher is tied to r21 runtime manifest and private schema. Not a portable one-click emulator installer.",
+  "source_commit": "921c5533659f104f319f3346ae54bae4f02cdb95",
+  "archive_entries": 6,
+  "documentation_files": {
+    "README.md": {
+      "sha256": "d9ed3f8e48855a9e145058d96ec4f86e3f34ef923b9772c2116fed41e2f76817"
+    },
+    "LICENSE.txt": {
+      "sha256": "781bbdf040b7d0286c47cca6bffdb9148dfe751c0c9cabdf1a1752412a2e56b4"
+    }
+  }
+}

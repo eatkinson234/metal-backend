@@ -1,0 +1,87 @@
+{
+  "version": "58.4.0",
+  "source_commit": "921c5533659f104f319f3346ae54bae4f02cdb95",
+  "files": [
+    "run-cpu-checks.sh",
+    ".gitignore",
+    "build-launcher.sh",
+    "Tools/RenderIcon.swift",
+    "Tests/SelfTelemetrySelfTest.swift",
+    "Tests/LobbySelfTest.swift",
+    "gatecheck-src/main.swift",
+    "Sources/NativePreviewSessionClaim.swift",
+    "Sources/NativeLobbyConfiguration.swift",
+    "Sources/InputSampling.swift",
+    "Sources/NativeLobbyLifecycle.swift",
+    "Sources/LobbyWindowChrome.swift",
+    "Sources/SlotBook.swift",
+    "Sources/LobbyGate.swift",
+    "Sources/NativeSelfTelemetrySupervisor.swift",
+    "Sources/LogoMark.swift",
+    "Sources/CouchDesign.swift",
+    "Sources/NativePreviewEnvironment.swift",
+    "Sources/NativeLobbyApp.swift",
+    "Sources/InputTiming.swift",
+    "Sources/SocketSender.c",
+    "Fixtures/seed-config.json",
+    "Fixtures/native-serialized-capacity-1.json",
+    "Fixtures/expected-prepared-capacity-8.json",
+    "Fixtures/expected-prepared-capacity-4.json",
+    "Fixtures/expected-prepared-capacity-1.json",
+    "Fixtures/native-serialized-capacity-8.json",
+    "Fixtures/native-serialized-capacity-4.json"
+  ],
+  "path_redaction_files": [
+    "Fixtures/seed-config.json",
+    "Fixtures/native-serialized-capacity-1.json",
+    "Fixtures/expected-prepared-capacity-8.json",
+    "Fixtures/expected-prepared-capacity-4.json",
+    "Fixtures/expected-prepared-capacity-1.json",
+    "Fixtures/native-serialized-capacity-8.json",
+    "Fixtures/native-serialized-capacity-4.json"
+  ],
+  "test_only_fixture_pin_replacements": [
+    {
+      "original": "63fb88855966316187945f6287ac8790fddadb86972471c11cfe221fb8f07a53",
+      "public": "968bee7beba874d89c57ee0f535a6a6d70724f97604a991d845d10d47ef0b21a"
+    },
+    {
+      "original": "bd63d0e15ee20931917fc022c191a2aa887c871b046d4f64dde960a4c6f55a54",
+      "public": "eab1ac76a03d21684780e34fb99cb6ba13963af45de7b4f01cc839e1ef641185"
+    },
+    {
+      "original": "00a0b66bec02208d18cb443da034cd76d93c51897e4b779dba8aa101d689cd67",
+      "public": "c58ca038bdbd3bd5681227ae968981a5e60fed4693f7aea24dc3d7adb00c6b1f"
+    },
+    {
+      "original": "aff81a032759df2e47f11da2d59429c316d4eb70af485292d587ae6ed32c7e66",
+      "public": "75d3cc43e09961add6b6a646779054f7b9d2550338e0d6894c20ea5e15864d34"
+    },
+    {
+      "original": "9b7303749e32ffb134eb26cf55b78fe991f6e6cbf342c31bdcca54750044db16",
+      "public": "fdced6bce46375dab371e799639351370c7e50683eea17a6b642e408718cb0ef"
+    },
+    {
+      "original": "dae98e872413284df2fa14c7eea7cbdbc12c6bb8e95db405420107f14047c0c3",
+      "public": "3b025496eddc5c195afc169b4657328ba9ea84cdae958fffbbc181aa8089e5c9"
+    },
+    {
+      "original": "11223d7e5591b59975058f44c461941a32838994ae4ed1c3c3fd9a956e599d5c",
+      "public": "37d3da05fad91d42847d45cabee096383dd5867a6ab5ee21a6da48df80b8d6ef"
+    },
+    {
+      "original": "0bf0c29c2db7286f00def50d5815fef600bc619f845c07196979461a5f6e6b79",
+      "public": "d3f3555fe2f8748f5dccafe1707f2b25360e0318aabccb50d8b58ee438cdc8b2"
+    },
+    {
+      "original": "6f8f0cff07771f3d9e74bad954ebdad362a9a2d99067faf76532befcbc2488dc",
+      "public": "fe3cdfdfbad3fe5cdc012b3896986edf07aa8054dcf513f9ac63fa4522f52bfb"
+    },
+    {
+      "original": "e268b283e1f1800faad69bc03e199a214378ad07a15e23acd45ae569bd91c7b2",
+      "public": "16158ea41350e6afa350e4f1bef3b02279119c69b3a170dc0324f3a07cfc2f91"
+    }
+  ],
+  "production_source_byte_exact": true,
+  "public_test_limit": "Unchanged private-seed gate rejects redacted synthetic fixture. No bypass. Original local install records127 checks; not a fresh public-copy pass."
+}

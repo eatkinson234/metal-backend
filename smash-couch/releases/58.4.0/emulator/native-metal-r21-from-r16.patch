@@ -1,0 +1,1056 @@
+diff --git a/src/Ryujinx.Graphics.Gpu/Shader/DiskCache/ParallelDiskCacheLoader.cs b/src/Ryujinx.Graphics.Gpu/Shader/DiskCache/ParallelDiskCacheLoader.cs
+index f8cb6c5..29f00fc 100644
+--- a/src/Ryujinx.Graphics.Gpu/Shader/DiskCache/ParallelDiskCacheLoader.cs
++++ b/src/Ryujinx.Graphics.Gpu/Shader/DiskCache/ParallelDiskCacheLoader.cs
+@@ -29,6 +29,7 @@ namespace Ryujinx.Graphics.Gpu.Shader.DiskCache
+         public bool Active => !_cancellationToken.IsCancellationRequested;
+ 
+         private bool _needsHostRegen;
++        private bool _cacheReadFailed;
+ 
+         /// <summary>
+         /// Number of shaders that failed to compile from the cache.
+@@ -265,17 +266,20 @@ namespace Ryujinx.Graphics.Gpu.Shader.DiskCache
+                 if (diskCacheLoadException.Result != DiskCacheLoadResult.NoAccess)
+                 {
+                     _needsHostRegen = true;
++                    _cacheReadFailed = true;
+                 }
+             }
+             catch (InvalidDataException invalidDataException)
+             {
+                 Logger.Warning?.Print(LogClass.Gpu, $"Error decompressing the shader cache file. {invalidDataException.Message}");
+                 _needsHostRegen = true;
++                _cacheReadFailed = true;
+             }
+             catch (IOException ioException)
+             {
+                 Logger.Warning?.Print(LogClass.Gpu, $"Error reading the shader cache file. {ioException.Message}");
+                 _needsHostRegen = true;
++                _cacheReadFailed = true;
+             }
+ 
+             _asyncTranslationQueue.CompleteAdding();
+@@ -287,6 +291,18 @@ namespace Ryujinx.Graphics.Gpu.Shader.DiskCache
+ 
+             CheckCompilationBlocking();
+ 
++            // Metal stores no host binaries: every program is translated again from its guest code at each boot, which
++            // alone marks the cache for a rebuild. When every program of the shared cache read and compiled, the
++            // rebuild would only write the same entries again (guest code indices and specialization state) under a
++            // new timestamp, and it truncates the live files first, so a boot interrupted there could lose the whole
++            // cache. Keep the files as they are; read failures and programs that did not compile still rebuild.
++            if (_needsHostRegen && !_cacheReadFailed && _context.Capabilities.Api == TargetApi.Metal && _programList.Count == programCount)
++            {
++                _needsHostRegen = false;
++
++                Logger.Info?.Print(LogClass.Gpu, $"Shader cache unchanged ({programCount} programs); not rewriting it.");
++            }
++
+             if (_needsHostRegen && Active)
+             {
+                 // Rebuild both shared and host cache files.
+diff --git a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+index 830bdf6..8f38975 100644
+--- a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
++++ b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+@@ -56,6 +56,8 @@ namespace Ryujinx.Graphics.Metal
+         public readonly Texture[] RenderTargets => _currentState.RenderTargets;
+         public readonly Texture DepthStencil => _currentState.DepthStencil;
+         public readonly ComputeSize ComputeLocalSize => _currentState.ComputeProgram.ComputeLocalSize;
++        public readonly bool HasRenderProgram => _currentState.RenderProgram != null;
++        public readonly bool HasComputeProgram => _currentState.ComputeProgram != null;
+ 
+         // RGBA32F is the biggest format
+         private const int ZeroBufferSize = 4 * 4;
+@@ -937,6 +939,20 @@ namespace Ryujinx.Graphics.Metal
+                 {
+                     Logger.Error?.PrintMsg(LogClass.Gpu, "No vertex function");
+                 }
++
++                // A program that failed to compile must not leave the previous one bound: the next draw or dispatch
++                // would run that program with this one's bindings. Its stage is left unbound until the next
++                // successful bind, and Pipeline refuses work for an unbound stage.
++                if (prg.IsCompute)
++                {
++                    _currentState.ComputeProgram = null;
++                    SignalDirty(DirtyFlags.ComputePipeline | DirtyFlags.ArgBuffers);
++                }
++                else
++                {
++                    _currentState.RenderProgram = null;
++                    SignalDirty(DirtyFlags.RenderPipeline | DirtyFlags.ArgBuffers);
++                }
+                 return;
+             }
+ 
+diff --git a/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs b/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
+index f214ab7..51dbe34 100644
+--- a/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
++++ b/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
+@@ -155,7 +155,7 @@ namespace Ryujinx.Graphics.Metal
+         internal readonly record struct DiagnosticSnapshot(
+             long[] Counts, long[] TotalTicks, long Accepted, long Exported,
+             long DroppedQueue, long DroppedLimit, long DroppedError, long DroppedShutdown,
+-            long WriterErrors, int QueueDepth);
++            long WriterErrors, int QueueDepth, long[] DroppedLimitByKind);
+ 
+         internal static DiagnosticSnapshot SnapshotForTests() =>
+             Volatile.Read(ref _recorder)?.Snapshot() ?? default;
+@@ -179,17 +179,22 @@ namespace Ryujinx.Graphics.Metal
+         {
+             private const int QueueLimit = 8192;
+             private const long ExportLimit = 100000;
++            // Every present is exported regardless of duration, so in a long session they used to fill the whole
++            // limit within minutes and later slow program/pipeline waits had no detail left (audit F15). Presents
++            // may take at most half; the rest stays for the >= 4 ms events. Limit drops are counted per kind.
++            private const long PresentExportLimit = ExportLimit / 2;
+             private static readonly long ThresholdTicks = Math.Max(1, Stopwatch.Frequency / 250);
+             private readonly Event[] _queue = new Event[QueueLimit];
+             private readonly object _gate = new();
+             private readonly long[] _counts = new long[Enum.GetValues<NativeTimingKind>().Length];
+             private readonly long[] _totalTicks = new long[Enum.GetValues<NativeTimingKind>().Length];
++            private readonly long[] _dropLimitByKind = new long[Enum.GetValues<NativeTimingKind>().Length];
+             private readonly FileStream _file;
+             private readonly Thread _writer;
+             private readonly DateTime _startedUtc = DateTime.UtcNow;
+             private readonly long _startedTicks = Stopwatch.GetTimestamp();
+             private int _head, _tail, _queueCount, _active = 1, _shutdown;
+-            private long _lastPresent, _accepted, _exported, _dropQueue, _dropLimit;
++            private long _lastPresent, _accepted, _acceptedPresents, _exported, _dropQueue, _dropLimit;
+             private long _dropError, _dropShutdown, _writerErrors;
+             private int _errorReported;
+ 
+@@ -232,15 +237,17 @@ namespace Ryujinx.Graphics.Metal
+                     DropStopped();
+                     return;
+                 }
++                bool present = item.Kind is NativeTimingKind.Present or NativeTimingKind.PresentInterval;
+                 lock (_gate)
+                 {
+                     if (_active == 0)
+                     {
+                         DropStopped();
+                     }
+-                    else if (_accepted >= ExportLimit)
++                    else if (_accepted >= ExportLimit || (present && _acceptedPresents >= PresentExportLimit))
+                     {
+                         Interlocked.Increment(ref _dropLimit);
++                        _dropLimitByKind[(int)item.Kind]++;
+                     }
+                     else if (_queueCount == QueueLimit)
+                     {
+@@ -252,6 +259,7 @@ namespace Ryujinx.Graphics.Metal
+                         _tail = (_tail + 1) % QueueLimit;
+                         _queueCount++;
+                         _accepted++;
++                        if (present) _acceptedPresents++;
+                     }
+                 }
+             }
+@@ -289,7 +297,7 @@ namespace Ryujinx.Graphics.Metal
+                         Interlocked.Read(ref _exported), Interlocked.Read(ref _dropQueue),
+                         Interlocked.Read(ref _dropLimit), Interlocked.Read(ref _dropError),
+                         Interlocked.Read(ref _dropShutdown), Interlocked.Read(ref _writerErrors),
+-                        _queueCount);
++                        _queueCount, (long[])_dropLimitByKind.Clone());
+             }
+ 
+             private void WriteLoop()
+@@ -302,7 +310,7 @@ namespace Ryujinx.Graphics.Metal
+                         _startedUtc.ToString("O", CultureInfo.InvariantCulture) +
+                         "\",\"stopwatch_frequency\":" + Stopwatch.Frequency.ToString(CultureInfo.InvariantCulture) +
+                         ",\"start_ticks\":" + _startedTicks.ToString(CultureInfo.InvariantCulture) +
+-                        ",\"queue_limit\":8192,\"event_limit\":100000," +
++                        ",\"queue_limit\":8192,\"event_limit\":100000,\"present_event_limit\":50000," +
+                         "\"meaning\":\"CPU elapsed scopes and Present entry cadence, not GPU completion/display presentation; deadline termination may omit the final second\"," +
+                         "\"coherency\":\"periodic aggregates are nontransactional across producer threads; final follows queue drain\"}");
+                     output.Flush();
+@@ -368,7 +376,8 @@ namespace Ryujinx.Graphics.Metal
+                 {
+                     if (i != 0) line.Append(',');
+                     line.Append('"').Append((NativeTimingKind)i).Append("\":{\"count\":")
+-                        .Append(s.Counts[i]).Append(",\"total_ticks\":").Append(s.TotalTicks[i]).Append('}');
++                        .Append(s.Counts[i]).Append(",\"total_ticks\":").Append(s.TotalTicks[i])
++                        .Append(",\"dropped_limit\":").Append(s.DroppedLimitByKind[i]).Append('}');
+                 }
+                 line.Append("}}");
+                 output.WriteLine(line);
+diff --git a/src/Ryujinx.Graphics.Metal/Pipeline.cs b/src/Ryujinx.Graphics.Metal/Pipeline.cs
+index 4af8f03..594317e 100644
+--- a/src/Ryujinx.Graphics.Metal/Pipeline.cs
++++ b/src/Ryujinx.Graphics.Metal/Pipeline.cs
+@@ -138,6 +138,30 @@ namespace Ryujinx.Graphics.Metal
+             RenderFeedbackGuard.CountSkippedDraw(failure);
+         }
+ 
++        // A program that failed to compile leaves its stage unbound (EncoderStateManager.UpdateProgram): refuse that
++        // stage's work rather than encode the previous program with this one's bindings. Counted; logged on the
++        // first refusal and every 1000th.
++        private long _refusedDraws, _refusedDispatches;
++        internal (long Draws, long Dispatches) RefusedUnboundWork => (_refusedDraws, _refusedDispatches);
++
++        private bool RefuseUnboundDraw()
++        {
++            if (_encoderStateManager.HasRenderProgram) return false;
++            long refused = ++_refusedDraws;
++            if (refused == 1 || refused % 1000 == 0)
++                Logger.Warning?.Print(LogClass.Gpu, $"Metal: refused {refused} draws with no valid program bound (a program failed to compile)");
++            return true;
++        }
++
++        private bool RefuseUnboundDispatch()
++        {
++            if (_encoderStateManager.HasComputeProgram) return false;
++            long refused = ++_refusedDispatches;
++            if (refused == 1 || refused % 1000 == 0)
++                Logger.Warning?.Print(LogClass.Gpu, $"Metal: refused {refused} dispatches with no valid program bound (a program failed to compile)");
++            return true;
++        }
++
+         public MTLBlitCommandEncoder GetOrCreateBlitEncoder()
+         {
+             return Cbs.Encoders.EnsureBlitEncoder();
+@@ -431,6 +455,11 @@ namespace Ryujinx.Graphics.Metal
+         public void DispatchCompute(int groupsX, int groupsY, int groupsZ, string debugGroupName)
+         {
+             using NSAutoreleasePool pool = new();
++            if (RefuseUnboundDispatch())
++            {
++                return;
++            }
++
+             MTLComputeCommandEncoder computeCommandEncoder = GetOrCreateComputeEncoder(true);
+ 
+             ComputeSize localSize = _encoderStateManager.ComputeLocalSize;
+@@ -460,7 +489,7 @@ namespace Ryujinx.Graphics.Metal
+             using NSAutoreleasePool pool = new();
+             try
+             {
+-            if (vertexCount == 0)
++            if (vertexCount == 0 || RefuseUnboundDraw())
+             {
+                 return;
+             }
+@@ -554,7 +583,7 @@ namespace Ryujinx.Graphics.Metal
+             using NSAutoreleasePool pool = new();
+             try
+             {
+-            if (indexCount == 0)
++            if (indexCount == 0 || RefuseUnboundDraw())
+             {
+                 return;
+             }
+@@ -633,6 +662,11 @@ namespace Ryujinx.Graphics.Metal
+             using NSAutoreleasePool pool = new();
+             try
+             {
++            if (RefuseUnboundDraw())
++            {
++                return;
++            }
++
+             // TODO: Reindex unsupported topologies
+             if (TopologyUnsupported(_encoderStateManager.Topology))
+             {
+@@ -690,6 +724,11 @@ namespace Ryujinx.Graphics.Metal
+             using NSAutoreleasePool pool = new();
+             try
+             {
++            if (RefuseUnboundDraw())
++            {
++                return;
++            }
++
+             if (TopologyUnsupported(_encoderStateManager.Topology))
+             {
+                 // TODO: Reindex unsupported topologies
+diff --git a/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs b/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs
+index 8787864..5c3ce7f 100644
+--- a/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs
++++ b/src/Ryujinx.Graphics.Metal/PresentRefreshGrid.cs
+@@ -40,9 +40,42 @@ namespace Ryujinx.Graphics.Metal
+     // transition). Near-refresh frames shown late despite a normal margin raise it one step when two of
+     // them force a hold or three come within LateWindow; so do TightFramesForRaise frames in a row on
+     // the later refresh with too little spare to shed (a commit steadily later than the lead allows).
+-    // Self-check: presented times off the grid, frames shown earlier than chosen, and near-refresh
+-    // frames shown late at the maximum lead are anomalies; three within 5 s disable the grid for 30 s
+-    // (for the session after the third time), which also leaves the composer free-running.
++    // A shed to the near refresh that ends in a hold with late frames within NearFailWithin is a failed retry of
++    // it (a hold from late commits alone proves nothing; a shed that holds for NearFailWithin clears the count).
++    // After NearFailuresToGiveUp failed retries, or one that started at the longest lead, the near refresh does
++    // not fit (rig A/B pace1 on the Dell at 4K: GPU work 5-13 ms after commit against a 4.3-7.5 ms near margin):
++    // the policy settles on the later refresh at the longest lead for NearRetryAfter (or until the display epoch
++    // changes) instead of retrying every ~32 s, since each failed retry shows one uneven interval. Settled, every
++    // choice keeps at least the lead plus half a refresh: the composer lock only knows "the lead before a
++    // refresh", so a smaller margin would let it pull commits onto the near refresh.
++    //  - entries and re-anchors take the first refresh beyond that floor, and so does the frame after a skipped
++    //    tick (two frames between commits, less a quarter refresh; a single late commit keeps its refresh);
++    //  - the floor tests use the composer tick's phase, estimated by the least-delayed commit of this frame and the
++    //    last PhaseFrames (re-expressed on the chain when it moves): the lock moves the tick, a late commit does
++    //    not. At 120 Hz an estimate under the floor (less FarDriftAllowance) counts as short, so a drift toward the
++    //    near refresh holds, to the first refresh beyond the floor. At 60 Hz a frame spans one refresh, so there is
++    //    no other phase to drift into: frames shown late count, and margins under HoldMargin as when not settled
++    //    (sustained late commits keep their refresh);
++    //  - a near frame shown late counts once, toward a hold, and holds at once while the estimate is under the
++    //    floor (and on the first frame after settling);
++    //  - a choice a whole refresh beyond the floor comes back at once within FreshFrames of an entry, re-anchor or
++    //    catch-up shed (a re-anchor the lock pulls two refreshes out returns within a frame or two; at 60 Hz that
++    //    drops one frame instead of staying a frame late), otherwise after SettledShedAfterFrames such frames in a
++    //    row, growing 4x when a hold follows such a shed within BackoffWithin (like the clean-run shed), so a hold
++    //    made by late commits is not undone by the next on-time one; other sheds stop at the floor too;
++    //  - a catch-up shed needs a real catch-up (commits under half a frame apart).
++    // Near frames shown late at the longest lead are the same evidence whatever put them there (a shed, or a
++    // re-anchor or entry after a stall without catch-up): three within LateWindow settle on the later refresh too.
++    // A frame chosen for the LATER refresh (at or beyond the floor when chosen, so a late commit does not count) and
++    // shown after it (GPU work plus latch beyond lead + one refresh; rig A/B pace3 on the Dell: 0-17 such frames a
++    // minute at 15.6 ms, varying by launch) is stronger evidence still: three within LateWindow settle at once, and
++    // settled they lengthen the lead (LeadStep, up to MaximumSettledLead), so each launch finds the room its frames
++    // need. The settled lead is kept for the display epoch (late commits never raise it: a longer lead costs every
++    // frame latency); a 10-minute retry of the near refresh starts from MaximumLockLead (a longer lead is not a near
++    // margin) with a fresh decision window.
++    // Self-check: presented times off the grid and frames shown earlier than chosen are anomalies; three
++    // within 5 s disable the grid for 30 s (for the session after the third time), which also leaves the
++    // composer free-running.
+     internal sealed class PresentRefreshGrid
+     {
+         public const double FramePeriod = 1.0 / 60.0;
+@@ -54,12 +87,20 @@ namespace Ryujinx.Graphics.Metal
+         public const int ShedAfterFrames = 32;
+         public const double LeadStep = 0.0005;
+         public const double MaximumLockLead = 0.0075;
++        public const double MaximumSettledLead = 0.010;
+         public const int TightFramesForRaise = 90;
+         private const int MaximumShedAfterFrames = 1920;
+         private const double BackoffWithin = 30.0;
+         private const double BackoffReset = 60.0;
+         private const double LateWindow = 10.0;
+         private const double LeadSettle = 0.5;
++        private const double NearFailWithin = 1.0;
++        private const int NearFailuresToGiveUp = 3;
++        private const double NearRetryAfter = 600.0;
++        private const double FarDriftAllowance = 0.0005;
++        private const int SettledShedAfterFrames = 8;
++        private const int FreshFrames = 12;
++        private const int PhaseFrames = 3;
+         private const int ConsistentNeeded = 3;
+         private const int History = 64;
+         private const double MarginBinWidth = 0.00025;
+@@ -72,6 +113,7 @@ namespace Ryujinx.Graphics.Metal
+             public long Window;
+             public double Refresh;
+             public double Margin;
++            public bool Far;
+         }
+ 
+         private readonly Choice[] _history = new Choice[History];
+@@ -89,10 +131,20 @@ namespace Ryujinx.Graphics.Metal
+         private int _cleanFrames, _shortMargins, _lateMargins, _pendingLates, _tightFrames, _shedAfter = ShedAfterFrames;
+         private long _window;
+         private double _lastShed = double.NegativeInfinity, _lastDisturbance = double.NegativeInfinity;
++        private double _nearRetryAt = double.NegativeInfinity;
++        private int _nearFailures;
++        private bool _shedPending, _justSettled;
++        private int _settledRun, _sinceAnchor, _settledShedAfter = SettledShedAfterFrames;
++        private double _lastSettledShed = double.NegativeInfinity;
++        private bool _lastFar, _wasSettled;
++        private readonly double[] _recentMargins = new double[PhaseFrames];
++        private int _recentCount, _recentNext;
+ 
+         private double _lockLead = PresentationPhaseAlignment.DisplayLockLeadSeconds;
+         private double _lastRaise = double.NegativeInfinity;
+         private readonly double[] _lateEvidence = { double.NegativeInfinity, double.NegativeInfinity };
++        private readonly double[] _farEvidence = { double.NegativeInfinity, double.NegativeInfinity };
++        private double _settledLead = MaximumLockLead;
+ 
+         private readonly int[] _marginBins = new int[160];
+         private int _marginCount;
+@@ -100,7 +152,7 @@ namespace Ryujinx.Graphics.Metal
+         private double _disabledUntil;
+         private int _anomalyCount;
+ 
+-        public long Frames, Entries, Holds, Reanchors, Sheds, BurstSheds, LeadRaises;
++        public long Frames, Entries, Holds, Reanchors, Sheds, BurstSheds, SettledSheds, LeadRaises, SettledLeadRaises, NearGiveUps;
+         public long OnTarget, Late, Early, OffGrid, Skipped, Invalid, Disables;
+ 
+         public double Period => _period;
+@@ -151,7 +203,17 @@ namespace Ryujinx.Graphics.Metal
+             // A new screen or presentation path (full screen vs composited) has its own latch: re-learn.
+             _lockLead = PresentationPhaseAlignment.DisplayLockLeadSeconds;
+             _lastRaise = double.NegativeInfinity;
++            _nearRetryAt = double.NegativeInfinity;
++            _nearFailures = 0;
++            _settledLead = MaximumLockLead;
++            _settledShedAfter = SettledShedAfterFrames;
++            _lastSettledShed = double.NegativeInfinity;
++            _shedAfter = ShedAfterFrames;
++            _lastShed = double.NegativeInfinity;
++            _lastDisturbance = double.NegativeInfinity;
++            _wasSettled = false;
+             Array.Fill(_lateEvidence, double.NegativeInfinity);
++            Array.Fill(_farEvidence, double.NegativeInfinity);
+             ResetDecisions();
+         }
+ 
+@@ -165,6 +227,8 @@ namespace Ryujinx.Graphics.Metal
+         public void ResetDecisions()
+         {
+             _lastRefresh = 0;
++            _shedPending = false;
++            _recentCount = _recentNext = 0;
+             ResetWindow();
+         }
+ 
+@@ -175,6 +239,7 @@ namespace Ryujinx.Graphics.Metal
+             _lateMargins = 0;
+             _pendingLates = 0;
+             _tightFrames = 0;
++            _settledRun = 0;
+             _window++;
+         }
+ 
+@@ -228,7 +293,7 @@ namespace Ryujinx.Graphics.Metal
+                 else if (difference > 0)
+                 {
+                     Late++;
+-                    OnLate(choice.Window, choice.Margin, now);
++                    OnLate(choice.Window, choice.Margin, choice.Far, now);
+                 }
+                 else
+                 {
+@@ -251,30 +316,71 @@ namespace Ryujinx.Graphics.Metal
+             }
+         }
+ 
+-        // A frame shown after the near refresh it was chosen for although its commit margin was normal: GPU
+-        // completion plus the compositor latch outran the lock lead. (A short margin already explains a late
+-        // frame and counted when it was chosen; a lead cannot help a frame late for the far refresh.) Within
+-        // the current decision window it counts like a short margin; three within LateWindow raise the lead.
++        // A frame shown after the refresh it was chosen for although its commit margin was normal. (A short margin
++        // already explains a late frame and counted when it was chosen.)
++        //  - Far: chosen for the later refresh at the lead plus half a refresh or more (the settled floor; recorded at
++        //    choose time, so a late commit that left a frame with less room does not count): GPU completion plus the
++        //    latch outran a whole extra refresh. The near refresh cannot fit; three within LateWindow settle, and
++        //    settled they lengthen the lead.
++        //  - Otherwise, within the current decision window it counts like a short margin. Not settled, three within
++        //    LateWindow also raise the lead, or at the longest lead settle on the later refresh. (Settled, the short
++        //    test uses the tick phase, so a late commit's frame is counted once, here.)
+         // Ignored for the lead for LeadSettle after a raise (frames committed before the composer moved).
+-        private void OnLate(long window, double margin, double now)
++        private void OnLate(long window, double margin, bool far, double now)
+         {
+-            if (margin < HoldMargin || margin >= _period) return;
+-            if (window == _window) _pendingLates++;
+-            if (now - _lastRaise < LeadSettle) return;
+-            if (_lockLead >= MaximumLockLead - 1e-9)
+-            {
+-                // The longest lead does not fit either: the display does not behave as modelled.
+-                Anomaly(now);
+-            }
+-            else if (now - Math.Min(_lateEvidence[0], _lateEvidence[1]) <= LateWindow)
++            if (margin < HoldMargin) return;
++            bool settled = now < _nearRetryAt;
++            if (far)
+             {
+-                RaiseLead(now);
++                if (now - _lastRaise < LeadSettle) return;
++                if (now - Math.Min(_farEvidence[0], _farEvidence[1]) > LateWindow)
++                {
++                    int oldest = _farEvidence[0] <= _farEvidence[1] ? 0 : 1;
++                    _farEvidence[oldest] = now;
++                }
++                else if (!settled) Settle(now);
++                else RaiseSettledLead(now);
++                return;
+             }
+-            else
++            if (window == _window) _pendingLates++;
++            // Settled, a frame chosen under the floor (its commit came late) and shown late counts toward a hold only:
++            // a longer lead would cost every frame latency for commits that come late.
++            if (settled || now - _lastRaise < LeadSettle) return;
++            if (now - Math.Min(_lateEvidence[0], _lateEvidence[1]) > LateWindow)
+             {
+                 int older = _lateEvidence[0] <= _lateEvidence[1] ? 0 : 1;
+                 _lateEvidence[older] = now;
+             }
++            else if (_lockLead >= MaximumLockLead - 1e-9)
++            {
++                // The longest lead does not fit either: the near refresh does not fit on this screen.
++                Settle(now);
++            }
++            else RaiseLead(now);
++        }
++
++        // The near refresh does not fit: stay on the later one at the longest lead until NearRetryAfter.
++        private void Settle(double now)
++        {
++            _nearRetryAt = now + NearRetryAfter;
++            _nearFailures = 0;
++            _shedPending = false;
++            _lockLead = Math.Max(MaximumLockLead, _settledLead);
++            _justSettled = true;
++            _lastRaise = now;
++            Array.Fill(_lateEvidence, double.NegativeInfinity);
++            Array.Fill(_farEvidence, double.NegativeInfinity);
++            NearGiveUps++;
++        }
++
++        private void RaiseSettledLead(double now)
++        {
++            if (_settledLead >= MaximumSettledLead - 1e-9) return;
++            _settledLead = Math.Min(Math.Max(_settledLead, _lockLead) + LeadStep, MaximumSettledLead);
++            _lockLead = _settledLead;
++            _lastRaise = now;
++            Array.Fill(_farEvidence, double.NegativeInfinity);
++            SettledLeadRaises++;
+         }
+ 
+         private void RaiseLead(double now)
+@@ -316,7 +422,30 @@ namespace Ryujinx.Graphics.Metal
+ 
+             double period = _period;
+             double frame = period * _refreshesPerFrame;
+-            double earliest = FirstRefreshAtOrAfter(now + HoldMargin);
++            bool settled = now < _nearRetryAt;
++            if (!settled && _wasSettled)
++            {
++                // The 10-minute retry of the near refresh: a fresh decision window (the settled clean run and short
++                // or late history say nothing about the near refresh), from the longest near lead. The composer slews
++                // to it at 0.1 ms a tick, so the shed to the near refresh waits for a fresh clean run (longer).
++                if (_lockLead > MaximumLockLead + 1e-9)
++                {
++                    _lockLead = MaximumLockLead;
++                    _lastRaise = now;
++                }
++                ResetWindow();
++            }
++            _wasSettled = settled;
++            // Settled on the later refresh: the composer lock puts commits the lead before a refresh, so a choice
++            // at least half a refresh beyond that keeps it on the later one (see the class comment).
++            double floor = settled ? Math.Max(HoldMargin, _lockLead + period / 2) : HoldMargin;
++            double earliest = FirstRefreshAtOrAfter(now + floor);
++            if (_shedPending && now - _lastShed >= NearFailWithin)
++            {
++                // The near refresh held after the shed: earlier failed retries were coincidences.
++                _shedPending = false;
++                _nearFailures = 0;
++            }
+             if (_lastRefresh > 0)
+             {
+                 // Re-express the previous choice on the current anchor; a jump means a different grid.
+@@ -338,6 +467,8 @@ namespace Ryujinx.Graphics.Metal
+                 }
+                 Entries++;
+                 ResetWindow();
++                _sinceAnchor = -1;
++                _recentCount = _recentNext = 0;
+             }
+             else
+             {
+@@ -345,36 +476,89 @@ namespace Ryujinx.Graphics.Metal
+                 double margin = choice - now;
+                 bool late = _pendingLates > 0;
+                 _pendingLates = 0;
+-                if (margin < -period / 2)
++                // A skipped composer tick (settled: the chain is broken, and at 60 Hz its margin would land on the near
++                // refresh) is two frames between commits; a single late commit is one frame plus its delay, and keeps
++                // its refresh (up to a quarter refresh short of two frames).
++                if (margin < -period / 2 || (settled && now - _lastChoose > frame * 2 - period / 4))
+                 {
+                     choice = earliest;
+                     Reanchors++;
+                     ResetWindow();
++                    _sinceAnchor = -1;
++                    _recentCount = _recentNext = 0;
+                 }
+                 else
+                 {
+-                    _shortMargins = ((_shortMargins << 1) | (margin < HoldMargin || late ? 1 : 0)) & 0xF;
++                    // Settled, the floor tests use the composer tick's phase, not this commit's margin: the lock moves
++                    // the tick, and a commit that comes late after its tick does not move it. The least-delayed commit
++                    // of this frame and the last PhaseFrames on the chain estimates it, so scattered late commits
++                    // neither count as a drift toward the near refresh nor block a shed, while a real drift (every
++                    // commit's margin shrinking with the tick) still does.
++                    double phaseMargin = margin;
++                    for (int i = 0; i < _recentCount; i++) phaseMargin = Math.Max(phaseMargin, _recentMargins[i]);
++                    double phaseEarliest = settled ? FirstRefreshAtOrAfter(choice - phaseMargin + floor) : earliest;
++                    double tested = settled ? phaseMargin : margin;
++                    double shortBelow = settled ? floor - FarDriftAllowance : HoldMargin;
++                    // At 60 Hz a frame spans one refresh, so the lock has a single phase and nothing to drift into:
++                    // settled, frames shown late count (sustained late commits would otherwise read as drift), and as
++                    // when not settled a commit margin under HoldMargin (OnLate does not count such a frame again).
++                    bool drift = !settled || _refreshesPerFrame > 1 ? tested < shortBelow : margin < HoldMargin;
++                    _shortMargins = ((_shortMargins << 1) | (drift || late ? 1 : 0)) & 0xF;
+                     _lateMargins = ((_lateMargins << 1) | (late ? 1 : 0)) & 0xF;
+-                    if (margin < MissMargin || BitOperations.PopCount((uint)_shortMargins) >= 2)
++                    // Settled, a choice a whole refresh beyond the floor comes back: at once in the first FreshFrames
++                    // after an entry, re-anchor or catch-up burst (the lock may have pulled them two refreshes out),
++                    // otherwise after _settledShedAfter such frames in a row (8, growing 4x when a hold follows such
++                    // a shed within BackoffWithin, like the clean-run shed), so a hold made by late frames is not
++                    // undone by the next on-time commit (hold and shed would alternate while commits come late).
++                    bool settledShedOk = settled && choice - period >= phaseEarliest - period / 4;
++                    _settledRun = settledShedOk ? _settledRun + 1 : 0;
++                    // Settled, a near choice holds at once right after settling or with a late frame pending (the
++                    // settle came from late frames).
++                    if (margin < MissMargin || BitOperations.PopCount((uint)_shortMargins) >= 2 ||
++                        (settled && (late || _justSettled) && tested < shortBelow))
+                     {
+                         // Late frames had margins of at least HoldMargin, where earliest is this same refresh.
+-                        choice = Math.Max(earliest, choice + period);
++                        bool atLongestLead = _lockLead >= MaximumLockLead - 1e-9;
++                        choice = Math.Max(phaseEarliest, choice + period);
+                         Holds++;
+                         if (BitOperations.PopCount((uint)_lateMargins) >= 2) RaiseLead(now);
+                         if (now - _lastShed < BackoffWithin) _shedAfter = Math.Min(_shedAfter * 4, MaximumShedAfterFrames);
++                        if (now - _lastSettledShed < BackoffWithin)
++                            _settledShedAfter = Math.Min(_settledShedAfter * 4, MaximumShedAfterFrames);
++                        if (_shedPending && now - _lastShed < NearFailWithin)
++                        {
++                            _shedPending = false;
++                            // The near refresh does not fit on this screen: settle on the later one.
++                            if (_lateMargins != 0 && (++_nearFailures >= NearFailuresToGiveUp || atLongestLead)) Settle(now);
++                        }
+                         _lastDisturbance = now;
+                         ResetWindow();
+                     }
++                    else if (settledShedOk && (_sinceAnchor < FreshFrames || _settledRun >= _settledShedAfter))
++                    {
++                        choice -= period;
++                        SettledSheds++;
++                        if (_sinceAnchor >= FreshFrames) _lastSettledShed = now;
++                        ResetWindow();
++                    }
+                     else if (margin > frame + ShedMargin && (_refreshesPerFrame > 1 || now - _lastChoose < frame / 2) &&
+-                        choice - period >= earliestShed)
++                        (!settled || now - _lastChoose < frame / 2) &&
++                        choice - period >= earliestShed && choice - period >= earliest - period / 4)
+                     {
++                        // Settled, only a real catch-up (commits under half a frame apart): after a hold the margin is
++                        // this large too, and the settled run above decides when to come back.
+                         choice -= period;
+                         BurstSheds++;
+                         ResetWindow();
++                        _sinceAnchor = -1;
+                     }
+                     else
+                     {
+-                        if (now - _lastDisturbance > BackoffReset) _shedAfter = ShedAfterFrames;
++                        if (now - _lastDisturbance > BackoffReset)
++                        {
++                            _shedAfter = ShedAfterFrames;
++                            _settledShedAfter = SettledShedAfterFrames;
++                        }
+                         double spare = margin - period;
+                         if (spare >= ShedMargin) _cleanFrames++;
+                         else
+@@ -394,20 +578,35 @@ namespace Ryujinx.Graphics.Metal
+                             }
+                         }
+                         else _tightFrames = 0;
+-                        if (_cleanFrames >= _shedAfter && choice - period >= earliestShed)
++                        if (_cleanFrames >= _shedAfter && choice - period >= earliestShed && choice - period >= earliest - period / 4)
+                         {
+                             choice -= period;
+                             Sheds++;
+                             _lastShed = now;
++                            // Settled, a shed only comes back to the later refresh: not a retry of the near one.
++                            _shedPending = !settled;
+                             ResetWindow();
+                         }
+                     }
+                 }
+             }
+ 
++            _justSettled = false;
++            _sinceAnchor = Math.Min(_sinceAnchor + 1, FreshFrames);
++            if (_lastRefresh > 0 && _recentCount > 0)
++            {
++                double moved = choice - (_lastRefresh + frame);
++                if (Math.Abs(moved) > period / 4)
++                    for (int i = 0; i < _recentCount; i++) _recentMargins[i] += moved;
++            }
++            _recentMargins[_recentNext] = choice - now;
++            _recentNext = (_recentNext + 1) % PhaseFrames;
++            _recentCount = Math.Min(_recentCount + 1, PhaseFrames);
+             _lastRefresh = choice;
+             _lastChoose = now;
+             _lastMargin = choice - now;
++            // Aimed at the later refresh (at or beyond the settled floor for the current lead): see OnLate.
++            _lastFar = _lastMargin >= _lockLead + period / 2 - FarDriftAllowance;
+             CountMargin(_lastMargin);
+             refresh = choice;
+             target = choice - period / 2 - LatchAllowance;
+@@ -454,6 +653,7 @@ namespace Ryujinx.Graphics.Metal
+             choice.Window = _window;
+             choice.Refresh = refresh;
+             choice.Margin = refresh > 0 ? _lastMargin : 0;
++            choice.Far = refresh > 0 && _lastFar;
+         }
+     }
+ }
+diff --git a/src/Ryujinx.Graphics.Metal/Program.cs b/src/Ryujinx.Graphics.Metal/Program.cs
+index 13bc842..5231af2 100644
+--- a/src/Ryujinx.Graphics.Metal/Program.cs
++++ b/src/Ryujinx.Graphics.Metal/Program.cs
+@@ -45,6 +45,8 @@ namespace Ryujinx.Graphics.Metal
+         public MTLFunction FragmentFunction;
+         public MTLFunction ComputeFunction;
+         public ComputeSize ComputeLocalSize { get; }
++        // Known before compilation, so a program that fails to compile still names the stage it would have bound.
++        internal bool IsCompute { get; }
+         // A transport variant is selected from the actual encoded primitive.
+         internal bool UsesPerVertexTransport { get; }
+         internal bool UsesPointTransport { get; }
+@@ -184,6 +186,7 @@ namespace Ryujinx.Graphics.Metal
+             _transportSnapshotPolicy = snapshotPolicy;
+             UsesPointTransport = transportRoot != null;
+             ComputeLocalSize = computeLocalSize;
++            IsCompute = Array.Exists(shaders, shader => shader.Stage == ShaderStage.Compute);
+             var creation = renderer.Programs.BeginCreate() ?? throw new ObjectDisposedException(nameof(MetalRenderer));
+             bool creationTransferred = false;
+             try
+diff --git a/src/Ryujinx.Graphics.Metal/ProgramCompileWorkers.cs b/src/Ryujinx.Graphics.Metal/ProgramCompileWorkers.cs
+index 2272ddd..6560486 100644
+--- a/src/Ryujinx.Graphics.Metal/ProgramCompileWorkers.cs
++++ b/src/Ryujinx.Graphics.Metal/ProgramCompileWorkers.cs
+@@ -18,6 +18,7 @@ namespace Ryujinx.Graphics.Metal
+         private static readonly BlockingCollection<Action> _queue = new();
+         private static readonly object _startGate = new();
+         private static volatile bool _started;
++        private static int _running;
+         private static long _queued;
+         private static long _waits;
+         private static long _waitTicks;
+@@ -49,10 +50,13 @@ namespace Ryujinx.Graphics.Metal
+                     {
+                         // Publish only after every worker is running; if a start
+                         // throws, the caller compiles synchronously instead of
+-                        // queueing work that nothing would consume.
+-                        for (int index = 0; index < Count; index++)
++                        // queueing work that nothing would consume. Workers that
++                        // did start stay counted, so a later attempt starts only
++                        // the missing ones and the pool never exceeds Count.
++                        while (_running < Count)
+                         {
+-                            new Thread(Work) { Name = $"Metal.ProgramCompile.{index}", IsBackground = true }.Start();
++                            new Thread(Work) { Name = $"Metal.ProgramCompile.{_running}", IsBackground = true }.Start();
++                            _running++;
+                         }
+                         _started = true;
+                         Logger.Info?.Print(LogClass.Gpu, $"MetalProgramWorkers: started {Count} program compile workers");
+diff --git a/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs b/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs
+index 6354416..4191c0d 100644
+--- a/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs
++++ b/src/Ryujinx.Graphics.Metal/RefreshAnchoredPacing.cs
+@@ -129,9 +129,10 @@ namespace Ryujinx.Graphics.Metal
+             Logger.Info?.PrintMsg(LogClass.Gpu, string.Create(CultureInfo.InvariantCulture,
+                 $"[CouchPacing] mode={(anchored ? "anchored" : "cpu")};refreshHz={(g.Period > 0 ? 1 / g.Period : 0):F4};k={g.RefreshesPerFrame};" +
+                 $"screen={_sample?.ScreenNumber};fullScreen={_sample?.FullScreen};sessionOff={g.DisabledForSession};" +
+-                $"leadMs={g.LockLead * 1000:F1};leadRaises={g.LeadRaises};marginP1Ms={margins.P1 * 1000:F2};marginP50Ms={margins.P50 * 1000:F2};" +
++                $"leadMs={g.LockLead * 1000:F1};leadRaises={g.LeadRaises};nearGiveUps={g.NearGiveUps};marginP1Ms={margins.P1 * 1000:F2};marginP50Ms={margins.P50 * 1000:F2};" +
+                 $"frames={g.Frames};cpuFrames={_cpuFrames};entries={g.Entries};holds={g.Holds};reanchors={g.Reanchors};" +
+                 $"sheds={g.Sheds};burstSheds={g.BurstSheds};shedAfter={g.ShedAfter};onTarget={g.OnTarget};late={g.Late};early={g.Early};" +
++                $"settledSheds={g.SettledSheds};settledLeadRaises={g.SettledLeadRaises};" +
+                 $"offGrid={g.OffGrid};skipped={g.Skipped};invalid={g.Invalid};disables={g.Disables};registerErrors={_registerErrors};" +
+                 $"lockTicks={lockStats.Ticks};lockAdjustments={lockStats.Adjustments};lockTotalMs={lockStats.TotalTicks * ms:F3};" +
+                 $"lockMaxMs={lockStats.MaximumAbsTicks * ms:F3}"));
+diff --git a/src/Ryujinx.Graphics.Metal/SpeculativePipelines.cs b/src/Ryujinx.Graphics.Metal/SpeculativePipelines.cs
+index 909e13e..353e0b6 100644
+--- a/src/Ryujinx.Graphics.Metal/SpeculativePipelines.cs
++++ b/src/Ryujinx.Graphics.Metal/SpeculativePipelines.cs
+@@ -50,6 +50,7 @@ namespace Ryujinx.Graphics.Metal
+         private static readonly BlockingCollection<Action> _builds = new();
+         private static readonly object _startGate = new();
+         private static volatile bool _started;
++        private static int _running;
+ 
+         private static long _offered, _unpredictable, _built, _failed, _hits, _unused, _preempted, _cancelled;
+         private static long _buildTicks, _maxBuildTicks;
+@@ -205,9 +206,11 @@ namespace Ryujinx.Graphics.Metal
+                     {
+                         try
+                         {
+-                            for (int index = 0; index < BuilderCount; index++)
++                            // Builders that did start stay counted: a later attempt starts only the missing ones.
++                            while (_running < BuilderCount)
+                             {
+-                                new Thread(Work) { Name = $"Metal.SpeculativeBuild.{index}", IsBackground = true }.Start();
++                                new Thread(Work) { Name = $"Metal.SpeculativeBuild.{_running}", IsBackground = true }.Start();
++                                _running++;
+                             }
+                         }
+                         catch (Exception exception)
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueConsumer.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueConsumer.cs
+index 860c106..1b04bba 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueConsumer.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueConsumer.cs
+@@ -52,7 +52,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+ 
+                 bufferItem = Core.Queue[0];
+ 
+-                if (Ryujinx.Graphics.GAL.FramePresentationTiming.IsEnabled)
++                if (Ryujinx.Graphics.GAL.FramePresentationTiming.IsEnabled || FencePhase.Enabled)
+                 {
+                     bufferItem.HostQueueDepth = Core.Queue.Count;
+                 }
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueCore.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueCore.cs
+index 7701494..4aa52d7 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueCore.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueCore.cs
+@@ -41,6 +41,9 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+ 
+         public ulong Owner { get; }
+ 
++        // Set only for the FencePhase diagnostic.
++        public Ryujinx.Graphics.Gpu.GpuContext FencePhaseGpu { get; }
++
+         public bool Active { get; private set; }
+ 
+         public const int BufferHistoryArraySize = 8;
+@@ -49,6 +52,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+ 
+         public BufferQueueCore(Switch device, ulong pid)
+         {
++            FencePhaseGpu = FencePhase.Enabled ? device.Gpu : null;
+             Slots = new BufferSlotArray();
+             IsAbandoned = false;
+             OverrideMaxBufferCount = 0;
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs
+index 0b7d62c..3eed34a 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/BufferQueueProducer.cs
+@@ -412,6 +412,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                 item.Fence = input.Fence;
+                 item.IsDroppable = Core.DequeueBufferCannotBlock || input.Async != 0;
+                 item.HostQueuedTicks = Ryujinx.Graphics.GAL.FramePresentationTiming.IsEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
++                if (FencePhase.Enabled) FencePhase.OnQueued(Core.FencePhaseGpu, item);
+ 
+                 item.GraphicBuffer.Set(Core.Slots[slot].GraphicBuffer);
+                 item.GraphicBuffer.Object.IncrementNvMapHandleRefCount(Core.Owner);
+@@ -439,10 +440,18 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+ 
+                     if (frontItem.IsDroppable)
+                     {
+-                        if (Core.StillTracking(ref frontItem))
++                        // The replaced front frame is never acquired: retire its own slot (as AOSP frees
++                        // front->mSlot; the incoming slot stays Queued) and drop the reference taken when it was
++                        // queued, but only while that slot still holds this queued frame. SetPreallocatedBuffer may
++                        // have reset the slot (releasing the reference), and the slot may since hold a newer frame,
++                        // even the incoming one; a matching buffer handle alone does not show that.
++                        if (Core.StillTracking(ref frontItem)
++                            && Core.Slots[frontItem.Slot].BufferState == BufferState.Queued
++                            && Core.Slots[frontItem.Slot].FrameNumber == frontItem.FrameNumber)
+                         {
+-                            Core.Slots[slot].BufferState = BufferState.Free;
+-                            Core.Slots[slot].FrameNumber = 0;
++                            Core.Slots[frontItem.Slot].BufferState = BufferState.Free;
++                            Core.Slots[frontItem.Slot].FrameNumber = 0;
++                            frontItem.GraphicBuffer.Object.DecrementNvMapHandleRefCount(Core.Owner);
+                         }
+ 
+                         Core.Queue.RemoveAt(0);
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/FencePhase.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/FencePhase.cs
+new file mode 100644
+index 0000000..36e5883
+--- /dev/null
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/FencePhase.cs
+@@ -0,0 +1,109 @@
++using Ryujinx.Common.Logging;
++using Ryujinx.Graphics.Gpu;
++using System;
++using System.Diagnostics;
++using System.Globalization;
++using System.Threading;
++
++namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
++{
++    // When the guest frame's own GPU fence signaled. Written once: at QueueBuffer when the fence had already
++    // signaled (or there is none), otherwise by the syncpoint callback on the GPU thread.
++    sealed class FencePhaseStamp
++    {
++        public long QueuedTicks;
++        public long ReadyTicks;
++        public bool ReadyAtQueue;
++    }
++
++    // Opt-in diagnostic (SMASH_COUCH_FENCE_PHASE=1) for the ~48 ms guest queue residence (QueueBuffer to composer
++    // acquire, depth 3 in the frame-phase runs): splits each frame's residence into its GPU work still running
++    // (QueueBuffer to its fence signaling) and a finished frame waiting (fence to acquire), and logs one summary
++    // line every 10 s. Changes no behavior; off, no frame is stamped and no fence callback is registered.
++    static class FencePhase
++    {
++        public static readonly bool Enabled = Environment.GetEnvironmentVariable("SMASH_COUCH_FENCE_PHASE") == "1";
++
++        private const int Capacity = 1024;
++        private static readonly double[] _residence = new double[Capacity];
++        private static readonly double[] _gpu = new double[Capacity];
++        private static readonly double[] _idle = new double[Capacity];
++        private static readonly double[] _depth = new double[Capacity];
++        private static int _count, _readyAtQueue, _notReadyAtAcquire, _unstamped;
++        private static long _windowStart;
++
++        // QueueBuffer, under the queue lock, after item.Fence is set.
++        public static void OnQueued(GpuContext gpu, BufferItem item)
++        {
++            FencePhaseStamp stamp = new() { QueuedTicks = Stopwatch.GetTimestamp() };
++            if (item.Fence.FenceCount == 0)
++            {
++                stamp.ReadyTicks = stamp.QueuedTicks;
++            }
++            else
++            {
++                // Runs at once when the syncpoint has already been reached.
++                item.Fence.RegisterCallback(gpu, _ => Volatile.Write(ref stamp.ReadyTicks, Stopwatch.GetTimestamp()));
++            }
++            stamp.ReadyAtQueue = Volatile.Read(ref stamp.ReadyTicks) != 0;
++            item.FencePhase = stamp;
++        }
++
++        // Composer thread, after a successful acquire.
++        public static void OnAcquired(BufferItem item)
++        {
++            long acquired = Stopwatch.GetTimestamp();
++            if (_windowStart == 0) _windowStart = acquired;
++            FencePhaseStamp stamp = item.FencePhase;
++            if (stamp == null)
++            {
++                _unstamped++;
++            }
++            else if (_count < Capacity)
++            {
++                double ms = 1000.0 / Stopwatch.Frequency;
++                long ready = Volatile.Read(ref stamp.ReadyTicks);
++                double residence = (acquired - stamp.QueuedTicks) * ms;
++                _residence[_count] = residence;
++                if (ready != 0 && ready <= acquired)
++                {
++                    _gpu[_count] = (ready - stamp.QueuedTicks) * ms;
++                    _idle[_count] = (acquired - ready) * ms;
++                }
++                else
++                {
++                    // Still rendering when acquired: the whole residence was GPU work.
++                    _gpu[_count] = residence;
++                    _idle[_count] = 0;
++                    _notReadyAtAcquire++;
++                }
++                _depth[_count] = item.HostQueueDepth;
++                if (stamp.ReadyAtQueue) _readyAtQueue++;
++                _count++;
++            }
++
++            if (acquired - _windowStart >= Stopwatch.Frequency * 10)
++            {
++                Log();
++                _windowStart = acquired;
++                _count = _readyAtQueue = _notReadyAtAcquire = _unstamped = 0;
++            }
++        }
++
++        private static void Log()
++        {
++            if (_count == 0) return;
++            string P(double[] values)
++            {
++                double[] sorted = values.AsSpan(0, _count).ToArray();
++                Array.Sort(sorted);
++                double At(double p) => sorted[Math.Min(_count - 1, (int)(p * _count))];
++                return string.Create(CultureInfo.InvariantCulture, $"{At(0.5):F2}/{At(0.9):F2}/{At(0.99):F2}/{sorted[^1]:F2}");
++            }
++            Logger.Info?.PrintMsg(LogClass.SurfaceFlinger, string.Create(CultureInfo.InvariantCulture,
++                $"[FencePhase] frames={_count};readyAtQueue={_readyAtQueue};notReadyAtAcquire={_notReadyAtAcquire};" +
++                $"unstamped={_unstamped};residenceMs(p50/p90/p99/max)={P(_residence)};gpuMs={P(_gpu)};idleMs={P(_idle)};" +
++                $"depth={P(_depth)}"));
++        }
++    }
++}
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/SurfaceFlinger.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/SurfaceFlinger.cs
+index eef66b2..23d3b0c 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/SurfaceFlinger.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/SurfaceFlinger.cs
+@@ -429,6 +429,8 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+ 
+                 if (acquireStatus == Status.Success)
+                 {
++                    if (FencePhase.Enabled) FencePhase.OnAcquired(item);
++
+                     if (_device.VSyncMode == VSyncMode.Unbounded)
+                     {
+                         if (_swapInterval != 0)
+diff --git a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/Types/BufferItem.cs b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/Types/BufferItem.cs
+index 22fbec6..c5ed7b8 100644
+--- a/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/Types/BufferItem.cs
++++ b/src/Ryujinx.HLE/HOS/Services/SurfaceFlinger/Types/BufferItem.cs
+@@ -22,6 +22,8 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+         // Host-side diagnostics (frame-phase only): Stopwatch time of QueueBuffer and the queue depth seen at acquire.
+         public long HostQueuedTicks;
+         public int HostQueueDepth;
++        // FencePhase diagnostic only (SMASH_COUCH_FENCE_PHASE=1).
++        public FencePhaseStamp FencePhase;
+ 
+         public BufferItem()
+         {
+@@ -59,6 +61,7 @@ namespace Ryujinx.HLE.HOS.Services.SurfaceFlinger
+                 Crop = Crop,
+                 HostQueuedTicks = HostQueuedTicks,
+                 HostQueueDepth = HostQueueDepth,
++                FencePhase = FencePhase,
+             };
+ 
+             item.GraphicBuffer.Set(GraphicBuffer);
+diff --git a/src/Ryujinx.Input.SDL2/CouchBridge.cs b/src/Ryujinx.Input.SDL2/CouchBridge.cs
+index 7cea991..474628e 100644
+--- a/src/Ryujinx.Input.SDL2/CouchBridge.cs
++++ b/src/Ryujinx.Input.SDL2/CouchBridge.cs
+@@ -495,6 +495,23 @@ internal sealed class CouchReceiver : IDisposable
+ 
+     private static float F(ReadOnlySpan<byte> s, int at) => BinaryPrimitives.ReadSingleLittleEndian(s.Slice(at));
+ 
++    // Input updates resume after a blocking dialog (NpadManager.UnblockInputUpdates, through the driver's
++    // Clear): transitions queued while nothing consumed them happened before the resume, so the next
++    // consuming read starts from the latest state, which is also the new baseline: an unchanged keepalive is
++    // not queued again ahead of the next real change. A button still held reads as held; a press released
++    // during the dialog does not replay. Unlike the diagnostic close, later packets are accepted as usual.
++    internal void DiscardQueuedTransitions()
++    {
++        lock (_gate)
++        {
++            for (int slot = 0; slot < 8; slot++)
++            {
++                ClearTransitions(slot);
++                _deliveredKey[slot] = _hasPacket ? TransitionKey(slot, _latest.AsSpan(PacketHeaderBytes + slot * SlotBytes, SlotBytes)) : 0;
++            }
++        }
++    }
++
+     // Diagnostic-only gate. Serialize with packet acceptance/read snapshots so
+     // no later datagram can restore held input, even if UI shutdown stalls.
+     internal void StopAndNeutralizeForDiagnosticClose()
+@@ -625,6 +642,11 @@ internal static class CouchBridge
+         if (Instance.IsValueCreated) Instance.Value.StopAndNeutralizeForDiagnosticClose();
+     }
+ 
++    internal static void DiscardQueuedTransitions()
++    {
++        if (Instance.IsValueCreated) Instance.Value.DiscardQueuedTransitions();
++    }
++
+     internal static InputFreshnessTraceFinalizationStatus InputFreshnessTraceStatus =>
+         TraceFinalizer?.Status ?? InputFreshnessTraceFinalizationStatus.Disabled;
+ 
+diff --git a/src/Ryujinx.Input.SDL2/SDL2GamepadDriver.cs b/src/Ryujinx.Input.SDL2/SDL2GamepadDriver.cs
+index c01d293..e0e6040 100644
+--- a/src/Ryujinx.Input.SDL2/SDL2GamepadDriver.cs
++++ b/src/Ryujinx.Input.SDL2/SDL2GamepadDriver.cs
+@@ -197,5 +197,11 @@ namespace Ryujinx.Input.SDL2
+                 }
+             }
+         }
++
++        // Called when input updates resume after a blocking dialog: see CouchReceiver.DiscardQueuedTransitions.
++        public void Clear()
++        {
++            if (CouchBridge.Enabled) CouchBridge.DiscardQueuedTransitions();
++        }
+     }
+ }

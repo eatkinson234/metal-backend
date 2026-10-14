@@ -545,3 +545,13 @@
 - 另公开 r19 两文件实验增量，完整树身份已验证，明确未安装/A-B 待结果；没有新运行、安装、配置变化。
 - 保留原机 127 软件检查与公开夹具门禁限制的区别；不再次尝试削弱门禁或重复失败检查。
 - 证据：`smash-couch/releases/58.3.0/BUILD-IDENTITY.json`、`PUBLICATION-CHECKS.json`、`emulator/SOURCE-MANIFEST.json`、`smash-couch/experiments/r19/SOURCE-IDENTITY.json`。
+
+
+### 2026-10-13 | 最新源码刷新、启动器应用下载与使用说明
+
+- 用户授权更新 GitHub，并特别要求上传 Smash Couch 应用、不要上传 Smash Bros 应用，以及提供使用说明。
+- 冻结正式安装 58.4.0/r21，核对两个可执行文件/包清单与源提交；新帧节奏启用。
+- r16→r21 重建 5,198 文件一致，r21q.3 实验树也一致；另记录未安装的深度快照诊断/修复候选。
+- ZIP 含四个预期启动器应用文件及离线 README/MIT 许可，无链接、游戏/密钥/固件/存档/缓存/模拟器应用；解压字节与签名通过。原 ad hoc 签名未改，无 Developer ID 或公证声明。
+- 提供下载、前提、加入、Xbox 映射、全屏、重连、正常退出与回滚说明；明确本地批准运行包要求，不宣传通用安装器。
+- 没有新游戏运行、安装、门禁绕过或系统安全设置变化。证据：`smash-couch/downloads/Smash-Couch-58.4.0-ARCHIVE.json`、`releases/58.4.0/PUBLICATION-CHECKS.json`。

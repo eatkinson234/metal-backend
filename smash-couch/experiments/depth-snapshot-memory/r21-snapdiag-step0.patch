@@ -1,0 +1,254 @@
+From e729177592392720b743122328beae6582b35593 Mon Sep 17 00:00:00 2001
+From: Smash Couch overnight <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 06:58:55 -0600
+Subject: [PATCH 1/2] Depth snapshot residency diagnostics (memory spike,
+ FIX-PLAN step 0; draft)
+
+Counts depth feedback snapshots that are created and not yet disposed (their last
+command buffer has not completed) with the snapshot root's allocated size, and
+how long each stayed resident. The native timing summary gains
+depth_snapshot_residency: resident count and bytes now, peak bytes and longest
+residency since the previous summary, retired count and summed residency
+(cumulative). Counts only: allocation, encoding and drawing are unchanged; a
+failure to read the size counts 0 bytes and never stops the draw.
+
+Compile-checked (compile-check.sh, offline packages). Not built into an app,
+not run, not reviewed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../DepthFeedbackSnapshot.cs                  | 16 ++++++
+ .../DepthSnapshotResidency.cs                 | 50 +++++++++++++++++++
+ .../EncoderStateManager.cs                    | 11 ++++
+ .../NativeTimingDiagnostics.cs                | 14 +++++-
+ 4 files changed, 89 insertions(+), 2 deletions(-)
+ create mode 100644 src/Ryujinx.Graphics.Metal/DepthSnapshotResidency.cs
+
+diff --git a/src/Ryujinx.Graphics.Metal/DepthFeedbackSnapshot.cs b/src/Ryujinx.Graphics.Metal/DepthFeedbackSnapshot.cs
+index 966af4d..edb3eb0 100644
+--- a/src/Ryujinx.Graphics.Metal/DepthFeedbackSnapshot.cs
++++ b/src/Ryujinx.Graphics.Metal/DepthFeedbackSnapshot.cs
+@@ -2,6 +2,7 @@ using SharpMetal.Metal;
+ using SharpMetal.ObjectiveCCore;
+ using System;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Runtime.Versioning;
+ using System.Threading;
+ 
+@@ -23,6 +24,8 @@ namespace Ryujinx.Graphics.Metal
+         private Texture _snapshot;
+         private readonly List<MTLTexture> _retainedSourceHandles = new(3);
+         private int _disposed;
++        // Diagnostics only (DepthSnapshotResidency): allocated bytes and the timestamp they were counted at.
++        private long _trackedBytes, _trackedSince;
+ 
+         internal Texture Texture => _snapshot;
+ 
+@@ -83,9 +86,22 @@ namespace Ryujinx.Graphics.Metal
+             return failure;
+         }
+ 
++        // Diagnostics only: counts this snapshot's allocated bytes as resident until Dispose. Call once, before the
++        // snapshot is shared with a lease; snapshots that are never tracked (fixtures) are not counted.
++        internal void TrackResidency(ulong allocatedBytes)
++        {
++            if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _trackedSince) != 0) return;
++            _trackedBytes = (long)Math.Min(allocatedBytes, (ulong)(long.MaxValue / 4));
++            if (Interlocked.CompareExchange(ref _trackedSince, Stopwatch.GetTimestamp(), 0) != 0) return;
++            DepthSnapshotResidency.Add(_trackedBytes);
++        }
++
+         public void Dispose()
+         {
+             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
++            long trackedSince = Interlocked.Exchange(ref _trackedSince, 0);
++            if (trackedSince != 0)
++                DepthSnapshotResidency.Retire(_trackedBytes, Math.Max(0, Stopwatch.GetTimestamp() - trackedSince));
+             Exception failure = null;
+             try
+             {
+diff --git a/src/Ryujinx.Graphics.Metal/DepthSnapshotResidency.cs b/src/Ryujinx.Graphics.Metal/DepthSnapshotResidency.cs
+new file mode 100644
+index 0000000..371c2b1
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Metal/DepthSnapshotResidency.cs
+@@ -0,0 +1,50 @@
++using System;
++using System.Threading;
++
++namespace Ryujinx.Graphics.Metal
++{
++    // Diagnostics only (memory spike, FIX-PLAN step 0). Depth feedback snapshots still owned (created and not yet
++    // disposed, that is until their last command buffer completed) and their allocated bytes; the peak bytes and the
++    // longest residency since the timing summary last read them; retired count and summed residency, cumulative.
++    // Counts only; nothing here changes what is allocated, encoded or drawn.
++    internal static class DepthSnapshotResidency
++    {
++        private static long _residentCount, _residentBytes, _peakResidentBytes;
++        private static long _retiredCount, _retiredResidencyTicks, _maxResidencyTicks;
++
++        internal static void Add(long bytes)
++        {
++            Interlocked.Increment(ref _residentCount);
++            RaiseTo(ref _peakResidentBytes, Interlocked.Add(ref _residentBytes, bytes));
++        }
++
++        internal static void Retire(long bytes, long residencyTicks)
++        {
++            Interlocked.Decrement(ref _residentCount);
++            Interlocked.Add(ref _residentBytes, -bytes);
++            Interlocked.Increment(ref _retiredCount);
++            Interlocked.Add(ref _retiredResidencyTicks, residencyTicks);
++            RaiseTo(ref _maxResidencyTicks, residencyTicks);
++        }
++
++        // Resets the peak to the current resident bytes and the longest residency to zero, so both cover the time
++        // since the previous call (the timing writer calls it once per summary).
++        internal static (long ResidentCount, long ResidentBytes, long PeakResidentBytes, long RetiredCount,
++            long RetiredResidencyTicks, long MaxResidencyTicks) Read()
++        {
++            long resident = Interlocked.Read(ref _residentBytes);
++            long peak = Math.Max(resident, Interlocked.Exchange(ref _peakResidentBytes, resident));
++            return (Interlocked.Read(ref _residentCount), resident, peak, Interlocked.Read(ref _retiredCount),
++                Interlocked.Read(ref _retiredResidencyTicks), Interlocked.Exchange(ref _maxResidencyTicks, 0));
++        }
++
++        private static void RaiseTo(ref long target, long value)
++        {
++            long current;
++            while (value > (current = Interlocked.Read(ref target)) &&
++                   Interlocked.CompareExchange(ref target, value, current) != current)
++            {
++            }
++        }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+index 8f38975..4a4a17a 100644
+--- a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
++++ b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+@@ -242,6 +242,7 @@ namespace Ryujinx.Graphics.Metal
+ 
+                 owner = new DepthFeedbackSnapshot(snapshot, sourceSamplingHandle, sourceIdentityHandle, sourceId.Root);
+                 snapshot = null;
++                TrackSnapshotResidency(owner, destId.Root);
+                 lease = new Auto<DepthFeedbackSnapshot>(owner);
+                 owner = null;
+                 // The dependency exists before the first encoded GPU use. It
+@@ -293,6 +294,16 @@ namespace Ryujinx.Graphics.Metal
+             return false;
+         }
+ 
++        // Diagnostics only (memory spike, FIX-PLAN step 0): the snapshot root's allocated size, counted as resident
++        // until the owner is disposed. Reading the size must never stop the draw.
++        private static void TrackSnapshotResidency(DepthFeedbackSnapshot owner, IntPtr snapshotRoot)
++        {
++            ulong bytes;
++            try { bytes = new MTLTexture(snapshotRoot).AllocatedSize; }
++            catch { bytes = 0; }
++            owner.TrackResidency(bytes);
++        }
++
+         internal void CaptureSnapshotAdmissionRejection(string context,
+             RenderFeedbackGuard.FeedbackGuardException failure)
+         {
+diff --git a/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs b/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
+index 51dbe34..8450132 100644
+--- a/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
++++ b/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
+@@ -312,7 +312,8 @@ namespace Ryujinx.Graphics.Metal
+                         ",\"start_ticks\":" + _startedTicks.ToString(CultureInfo.InvariantCulture) +
+                         ",\"queue_limit\":8192,\"event_limit\":100000,\"present_event_limit\":50000," +
+                         "\"meaning\":\"CPU elapsed scopes and Present entry cadence, not GPU completion/display presentation; deadline termination may omit the final second\"," +
+-                        "\"coherency\":\"periodic aggregates are nontransactional across producer threads; final follows queue drain\"}");
++                        "\"coherency\":\"periodic aggregates are nontransactional across producer threads; final follows queue drain\"," +
++                        "\"depth_snapshot_residency\":\"depth feedback snapshots created and not yet disposed (last command buffer not yet complete) with allocated bytes; peak and max residency since the previous summary; retired and residency ticks cumulative\"}");
+                     output.Flush();
+                     long lastSummary = Stopwatch.GetTimestamp();
+                     while (true)
+@@ -370,7 +371,16 @@ namespace Ryujinx.Graphics.Metal
+                     // Process-wide GC pause total and collection counts, so a slow second can be checked for GC.
+                     .Append(",\"gc_pause_ms\":").Append(GC.GetTotalPauseDuration().TotalMilliseconds.ToString("F3", CultureInfo.InvariantCulture))
+                     .Append(",\"gcs\":[").Append(GC.CollectionCount(0)).Append(',').Append(GC.CollectionCount(1))
+-                    .Append(',').Append(GC.CollectionCount(2)).Append(']')
++                    .Append(',').Append(GC.CollectionCount(2)).Append(']');
++                // Depth feedback snapshots still owned (resident) and their allocated bytes; the peak and the longest
++                // residency since the previous summary; retired count and summed residency ticks, cumulative.
++                var r = DepthSnapshotResidency.Read();
++                line.Append(",\"depth_snapshot_residency\":{\"resident\":").Append(r.ResidentCount)
++                    .Append(",\"resident_bytes\":").Append(r.ResidentBytes)
++                    .Append(",\"peak_resident_bytes\":").Append(r.PeakResidentBytes)
++                    .Append(",\"retired\":").Append(r.RetiredCount)
++                    .Append(",\"retired_residency_ticks\":").Append(r.RetiredResidencyTicks)
++                    .Append(",\"max_residency_ticks\":").Append(r.MaxResidencyTicks).Append('}')
+                     .Append(",\"aggregates\":{");
+                 for (int i = 0; i < s.Counts.Length; i++)
+                 {
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 0fdd732cd439b368f36d9ccb1370d2d0f0dd369a Mon Sep 17 00:00:00 2001
+From: Smash Couch overnight <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 07:03:50 -0600
+Subject: [PATCH 2/2] Residency diagnostics: the Codex review's two small fixes
+
+The review (reviews-20261013/codex-snapdiag-review.out) found the draft fit to
+build for measurement runs. Adopted: the new summary integers are formatted
+with the invariant culture, and the comments state the actual guarantees (a
+managed exception from the size query counts 0 bytes; TrackResidency is called
+once, before sharing, and is not a concurrent API; interval values are
+approximate). Compile-checked again; not built into an app, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../EncoderStateManager.cs                       |  3 ++-
+ .../NativeTimingDiagnostics.cs                   | 16 +++++++++-------
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+index 4a4a17a..507712c 100644
+--- a/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
++++ b/src/Ryujinx.Graphics.Metal/EncoderStateManager.cs
+@@ -295,7 +295,8 @@ namespace Ryujinx.Graphics.Metal
+         }
+ 
+         // Diagnostics only (memory spike, FIX-PLAN step 0): the snapshot root's allocated size, counted as resident
+-        // until the owner is disposed. Reading the size must never stop the draw.
++        // until the owner is disposed. A managed exception from the size query counts 0 bytes instead of stopping
++        // the draw. Called once, before the owner is shared with a lease (TrackResidency is not a concurrent API).
+         private static void TrackSnapshotResidency(DepthFeedbackSnapshot owner, IntPtr snapshotRoot)
+         {
+             ulong bytes;
+diff --git a/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs b/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
+index 8450132..0c3def4 100644
+--- a/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
++++ b/src/Ryujinx.Graphics.Metal/NativeTimingDiagnostics.cs
+@@ -373,14 +373,16 @@ namespace Ryujinx.Graphics.Metal
+                     .Append(",\"gcs\":[").Append(GC.CollectionCount(0)).Append(',').Append(GC.CollectionCount(1))
+                     .Append(',').Append(GC.CollectionCount(2)).Append(']');
+                 // Depth feedback snapshots still owned (resident) and their allocated bytes; the peak and the longest
+-                // residency since the previous summary; retired count and summed residency ticks, cumulative.
++                // residency (of snapshots retired) since the previous summary; retired count and summed residency
++                // ticks, cumulative. Nontransactional reads: interval values are approximate.
+                 var r = DepthSnapshotResidency.Read();
+-                line.Append(",\"depth_snapshot_residency\":{\"resident\":").Append(r.ResidentCount)
+-                    .Append(",\"resident_bytes\":").Append(r.ResidentBytes)
+-                    .Append(",\"peak_resident_bytes\":").Append(r.PeakResidentBytes)
+-                    .Append(",\"retired\":").Append(r.RetiredCount)
+-                    .Append(",\"retired_residency_ticks\":").Append(r.RetiredResidencyTicks)
+-                    .Append(",\"max_residency_ticks\":").Append(r.MaxResidencyTicks).Append('}')
++                CultureInfo invariant = CultureInfo.InvariantCulture;
++                line.Append(",\"depth_snapshot_residency\":{\"resident\":").Append(r.ResidentCount.ToString(invariant))
++                    .Append(",\"resident_bytes\":").Append(r.ResidentBytes.ToString(invariant))
++                    .Append(",\"peak_resident_bytes\":").Append(r.PeakResidentBytes.ToString(invariant))
++                    .Append(",\"retired\":").Append(r.RetiredCount.ToString(invariant))
++                    .Append(",\"retired_residency_ticks\":").Append(r.RetiredResidencyTicks.ToString(invariant))
++                    .Append(",\"max_residency_ticks\":").Append(r.MaxResidencyTicks.ToString(invariant)).Append('}')
+                     .Append(",\"aggregates\":{");
+                 for (int i = 0; i < s.Counts.Length; i++)
+                 {
+-- 
+2.54.0 (Apple Git-157)
+

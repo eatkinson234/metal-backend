@@ -1,11 +1,11 @@
 # Smash Couch 原生 Metal
 
-**最新正式安装：58.3.0 / 原生 Metal .58 r16**（2026-10-12 05:47 MDT）。已重新核对本机安装的两个可执行文件及运行包清单哈希。
+**最新已安装：58.4.0 / 原生 Metal .58 r21**（2026-10-13）。
 
-- [最新状态、已有证据与剩余验证](STATUS.md)
-- [58.3.0 已安装版本源码与构建/回滚](releases/58.3.0)
-- [58.3.0 构建身份](releases/58.3.0/BUILD-IDENTITY.json)
-- [r19 最新实验源码，未安装](experiments/r19)
-- [58.2.0 历史快照](releases/58.2.0)、[.53 历史构建说明](BUILD.md)
+- [下载 Smash Couch 启动器应用](downloads) · [How to use / 使用说明](HOW-TO-USE.md)
+- [最新进度与验证限制](STATUS.md)
+- [58.4.0 源码、构建与回滚](releases/58.4.0) · [安装身份](releases/58.4.0/BUILD-IDENTITY.json)
+- [r21q.3 未安装实验](experiments/r21q3) · [深度快照内存候选，未安装](experiments/depth-snapshot-memory)
+- 历史：[58.3](releases/58.3.0)、[58.2](releases/58.2.0)、[.53](BUILD.md)
 
-当前运行保留 legacy pacing；r19 不能冒充已经交付。根目录 `src/` 原项目和 .53/58.2 历史快照保持保留。仓库仅含源码、文档与身份清单，不包含游戏、固件、密钥、存档、运行缓存或签名应用。
+应用下载只含控制器大厅，依赖本地兼容运行包，不含 Smash Bros 游戏、模拟器应用、密钥、固件、存档或运行缓存。新帧节奏已启用；短队列和内存候选未安装。原项目与历史快照保持保留。
